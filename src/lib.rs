@@ -1480,7 +1480,7 @@ const RIM: i16 = i16::MIN + 1;
 /// The disc is the attest ball's disc, point for point: the same view, `shade` and `Look::attest()` (style, material, engraving, mirror, electric flame), tapering into the device's colour at the rim by √(1 − |p|²) rather than the button's twelfth power, which is the colour of the set's line outside, so every component blends into the outline. The ball's scale in pixels is the component's: its radius is 1/|dλ/dpixel| (in closed form for the cardioid and the period-2 disc, |λ′| = 2/|√(1 − 4c)| and 4; elsewhere λ again half a pixel along and the difference), and its lines are 2⁻⁷ of that, as the ball's are of its own.
 /// Where no cycle is found within 2⁶ steps (right at a rim, converging slowly, or a period past 2⁶) the device's colour stands, as the ball's rim does.
 /// `inside` is a bitmask of the pixels (one bit per pixel of `buf`, 64 a word, row after row) that hold any of a component, and `map` the masked pixels' samples (`FreshCell`, in pixel order, k² a pixel): with `full` every pixel renders and both are written; without, only the masked pixels render, from the map, so a new `text` costs the balls' shading alone and leaves the outline as it was. A map too short for every masked sample holds the first ones; the rest are worked out again each time. The full render draws from the cells as stored, so the first keystroke moves nothing but the ball.
-/// Sampling: a `k` × `k` stratified grid per pixel, averaged in linear light with coverage (the glow is light over the background, coverage its brightness).
+/// Sampling: one sample at a pixel's centre outside the components; a `k` × `k` stratified grid per pixel that touches one, averaged in linear light with coverage (the glow is light over the background, coverage its brightness).
 pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], text: &str, k: u32, inside: &mut [u64], map: &mut [FreshCell], full: bool) {
     let th = Theme::from_bytes(&draw(salt, 1, 0, &[]));
     let aura = soft(&th, 0.72, 0.15, 0., (0., 0.));
@@ -1612,6 +1612,16 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
                 continue;
             }
             // k up to 2³: 2⁶ samples a pixel.
+            // Only the components are anti-aliased (owner, 2026-10-29): the outline and its halo come from the distance estimate, smooth in pixels already, so a pixel whose centre falls outside takes that one sample and keeps no map entries. A component's rim and the line outside it are the same colour, so where a pixel's centre misses a rim it covers, nothing shows.
+            if full {
+                let centre_cell = cell(px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+                if centre_cell[2] == OUTSIDE {
+                    inside[i >> 6] &= !(1u64 << (i & 63));
+                    let (s, a, _) = colour(centre_cell);
+                    buf[i] = pack(s, a);
+                    continue;
+                }
+            }
             let mut cells = [[0i16; 3]; 1 << 6];
             let kk2 = (k * k) as usize;
             let mut any = false;
