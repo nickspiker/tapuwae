@@ -4,8 +4,8 @@
 //!
 //! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the colouring method and the theme: one soft, low-contrast scheme for every device, varied widely in tone, polarity, edge, hue relations and saturation (see `Theme`).
 //!
-//! Placement, the descent: pick x in [−2, 0.375] and come straight down the line Re c = x from Im c = 2, each step the proven lower bound on the distance to the Mandelbrot set (see `descend`), until within 2⁻¹² of the set — the set's skyline seen from above, its outermost contact on that line, from the antenna through the bulb tops and seahorse valley to the cusp.
-//! For x past the cusp (0.25) the line misses the set and reaches the real axis just outside it, in the parabolic-implosion region, which is kept.
+//! Placement, the descent: pick x in [−2, X_RIGHT ≈ 0.4715], the set's whole real extent, slanted toward the right (density rising linearly from 0 at the antenna's tip, as x = −2 + span·√u, since the left third is all needles), and come straight down the line Re c = x from Im c = 2, each step the proven lower bound on the distance to the Mandelbrot set (see `descend`), until within 2⁻¹² of the set — the set's skyline seen from above, its outermost contact on that line, from the antenna through the bulb tops and seahorse valley to the cusp.
+//! Lines between the cusp (0.25) and the cardioid's own rightmost point (0.375) that pass beside the bulbs reach the real axis just outside the set, in the parabolic-implosion region, which is kept; past 0.375 they land on the decorations of the bulbs near the top right.
 //! c is the landing point raised by 2^−(4..12) back up the line it came down (see HEIGHT_STOPS). Every point of that line above the landing was proven outside the set by the steps that crossed it, so c is always outside, J(c) is a Cantor dust with no inside to go flat, and near the boundary J(c) resembles the Mandelbrot set around c.
 //!
 //! The eye: a repelling periodic point of J(c) is the eye of a spiral whose multiplier λ = (f^p)′ says how it repeats (zooming by |λ| and turning by arg λ maps it onto itself), and the ROOT whorl, the largest, is the cycle closest to neutral (smallest ln|λ|).
@@ -349,6 +349,9 @@ pub fn root_cycle(c: (f64, f64), land: (f64, f64)) -> Option<((f64, f64), f64, f
     None
 }
 
+/// The Mandelbrot set's rightmost real extent, measured with `descend` (the last line that lands, on a 2⁻¹² grid, is Re c = 0.47132, on the bulbs' decorations near Im 0.36), rounded up a hair: past the cardioid's own rightmost point (0.375) by the decorations of the 1/5, 1/6 and 1/7 bulbs.
+pub const X_RIGHT: f64 = 0.4715;
+
 /// Newton steps when solving for an attracting cycle.
 const NEWTON_STEPS: u32 = 1 << 5;
 /// Iteration cap for classifying a point of the parameter plane.
@@ -395,7 +398,8 @@ fn classify(c: (f64, f64)) -> Class {
     for n in 1..CLASSIFY_ITER {
         let r2 = z.0 * z.0 + z.1 * z.1;
         if r2 > BAIL_SQ {
-            return Class::Outside { n, r: r2.sqrt(), dm: (dz.0 * dz.0 + dz.1 * dz.1).sqrt() };
+            // hypot, not √(x² + y²): near the escape dz's components reach about 10¹⁶⁰, whose squares overflow f64 though dz does not, and an infinite derivative reads as distance 0, a false landing (it put the "set" at Re 0.49).
+            return Class::Outside { n, r: r2.sqrt(), dm: dz.0.hypot(dz.1) };
         }
         if r2 < smallest {
             let ratio = r2 / smallest;
@@ -448,13 +452,14 @@ impl Params {
         Self::new_placed(salt, text, true)
     }
 
-    /// As `new`, choosing whether the descent's x is banded per device (`banded`: the device's own stretch of 1/12 of [−2, 0.375], every key inside it) or free over the whole span.
+    /// As `new`, choosing whether the descent's x is banded per device (`banded`: the device's own stretch of 1/12 of [−2, X_RIGHT], every key inside it) or free over the whole span; either way the draw is slanted toward the right (see the crate's doc).
     pub fn new_placed(salt: &[u8; 32], text: &str, banded: bool) -> Self {
         let f = draw(salt, 1, 0, &[]);
         // The device's stretch of the real axis: 1/12 of the span, placed so it fits.
-        let span = 2.375;
+        let span = X_RIGHT + 2.;
         let width = span / 12.;
-        let x0 = -2. + unit(&draw(salt, 5, 0, &[])[0..4]) * (span - width);
+        // √u: density rising linearly toward the right, so fewer devices land among the antenna's needles.
+        let x0 = -2. + unit(&draw(salt, 5, 0, &[])[0..4]).sqrt() * (span - width);
         let theme = Theme::from_bytes(&f);
         let mode = f[12] & 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
@@ -465,7 +470,7 @@ impl Params {
         loop {
             let t = draw(salt, 3, n, text.as_bytes());
             n += 1;
-            let x = if banded { x0 + unit(&t[16..20]) * width } else { -2. + unit(&t[16..20]) * span };
+            let x = if banded { x0 + unit(&t[16..20]) * width } else { -2. + unit(&t[16..20]).sqrt() * span };
             let (land, _, _) = descend(x);
             let c = (land.0, land.1 + (-(4. + unit(&t[20..24]) * HEIGHT_STOPS as f64)).exp2());
             let along = j_extent(c);
