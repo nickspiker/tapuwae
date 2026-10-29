@@ -221,15 +221,19 @@ fn orbit<L: Lane>(px: L, py: L, v: &View) -> Orbit<L> {
         let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
         trap_sq = live::<L, _>(running, trap_sq.min(tx * tx + ty * ty), trap_sq);
         let rz = r2.sqrt();
+        // One reciprocal a step serves every term that divides by |z| or |z|² (the flames' weights and means, the direction's turn): a vector divide is among the slowest instructions, and this loop took seven a step.
+        let inv = one / rz;
+        let inv2 = inv * inv;
         // Flames: iter² weights; past |z|² = 4 the z-flame tapers as (1 − ((ln ln |z|² − ln(2 ln 2)) / ln ln bail)²)⁶, which is in [0, 1] there because |z|² > 4 makes ln ln |z|² > ln(2 ln 2).
         let it = (n + 1) as f32;
         let it2 = it * it;
         let taper = pick(running & r2.gt(L::splat(4.)), || { let t = (r2.fln().fln() - ln_2ln2) / lnln_bail; let t = one - t * t; let t = t * t; t * t * t }, one);
         let wq = taper * it2;
         fq_w = live::<L, _>(running, fq_w + wq, fq_w);
-        fq = live::<L, _>(running, (fq.0 + z.0 * wq / rz, fq.1 + z.1 * wq / rz), fq);
-        fc_w = live::<L, _>(running, fc_w + one / rz, fc_w);
-        fc = live::<L, _>(running, (fc.0 + z.0 / r2, fc.1 - z.1 / r2), fc);
+        let wq_inv = wq * inv;
+        fq = live::<L, _>(running, (fq.0 + z.0 * wq_inv, fq.1 + z.1 * wq_inv), fq);
+        fc_w = live::<L, _>(running, fc_w + inv, fc_w);
+        fc = live::<L, _>(running, (fc.0 + z.0 * inv2, fc.1 - z.1 * inv2), fc);
         let dm_next = rz * 2. * dm + plus;
         // Only a running lane rescales: a frozen one's derivative would keep growing and move its dm_exp after its escape.
         let big = running & dm_next.gt(L::splat((1u64 << 63) as f32 * 2.));
@@ -240,10 +244,11 @@ fn orbit<L: Lane>(px: L, py: L, v: &View) -> Orbit<L> {
             plus = select(big, plus * s, plus);
             dm_exp = select(big, dm_exp + 64., dm_exp);
         }
+        // The direction turns by z/|z|, a unit number: a product of unit numbers stays unit to rounding, so it needs no root or divide a step; it is made unit once more where it is read.
         if julia {
-            let d = (dir.0 * z.0 - dir.1 * z.1, dir.0 * z.1 + dir.1 * z.0);
-            let dl = (d.0 * d.0 + d.1 * d.1).sqrt();
-            dir = live::<L, _>(running, (d.0 / dl, d.1 / dl), dir);
+            let (zx, zy) = (z.0 * inv, z.1 * inv);
+            let d = (dir.0 * zx - dir.1 * zy, dir.0 * zy + dir.1 * zx);
+            dir = live::<L, _>(running, d, dir);
         }
         z = live::<L, _>(running, (x2 - y2 + c.0, z.0 * 2. * z.1 + c.1), z);
     }
@@ -253,7 +258,9 @@ fn orbit<L: Lane>(px: L, py: L, v: &View) -> Orbit<L> {
         pick(escaped, || {
             let rz = (z.0 * z.0 + z.1 * z.1).sqrt();
             let (zx, zy) = (z.0 / rz, z.1 / rz);
-            (zx * dir.0 + zy * dir.1, zy * dir.0 - zx * dir.1)
+            let dl = (dir.0 * dir.0 + dir.1 * dir.1).sqrt();
+            let (dx, dy) = (dir.0 / dl, dir.1 / dl);
+            (zx * dx + zy * dy, zy * dx - zx * dy)
         }, (zero, zero))
     } else {
         (zero, zero)
