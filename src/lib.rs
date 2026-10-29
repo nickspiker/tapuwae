@@ -530,17 +530,32 @@ struct Attest {
     levels: f32,
     /// Rays per turn at each level: 2², 2³ or 2⁴.
     rays: f32,
+    /// How the picture is made: 0 the avatars' soft colours, 1 a medal (the set in bas-relief, struck in metal), 2 enamel (cloisonné: the engraving's cells filled with colour, the set and the wires in metal), 3 lacquer (the avatars' colouring, deeper and glazed, the set raised in metal). A device draws 1, 2 or 3, never the avatars' 0.
+    style: u8,
+    /// The metals (indices into `METALS`): `metal_a` for the set and the wires, `metal_b` for a medal's field and the button's bezel; the same metal for half of devices, two for the rest (a bimetal).
+    metal_a: u8,
+    metal_b: u8,
+    /// The button's bezel: 0 a plain round, 1 reeded (fine ridges across it, as a coin's edge), 2 a double ring.
+    bezel: u8,
+    /// The enamel's cell colours: a seed for which of the four each cell takes.
+    cells: u32,
 }
 
 impl Attest {
     fn new(salt: &[u8; 32]) -> Self {
         let a = draw(salt, 64, 0, &[]);
+        let metal_a = a[6] & 7;
         Attest {
             material: a[0] & 3,
             engrave: a[1] & 3,
             mirror: a[2] & 1 == 1,
             levels: ((a[3] % 3) as f32 - 2.).exp2(),
             rays: ((2 + a[4] % 3) as f32).exp2(),
+            style: 1 + a[5] % 3,
+            metal_a,
+            metal_b: if a[7] & 1 == 0 { metal_a } else { (metal_a + 1 + (a[7] >> 1) % 7) & 7 },
+            bezel: a[8] % 3,
+            cells: u32::from_le_bytes([a[9], a[10], a[11], a[12]]),
         }
     }
 }
@@ -837,6 +852,47 @@ fn positive_part(x: f32) -> f32 {
     0.5 * (x + (x * x + d * d).sqrt())
 }
 
+/// The metals' colours in linear light, each its reflectance at normal incidence (published F0 measurements; rose gold and blued titanium as their alloys and oxide show): gold, silver, copper, bronze, steel, rose gold, brass, titanium.
+const METALS: [[f32; 3]; 8] = [
+    [1.00, 0.71, 0.29],
+    [0.95, 0.93, 0.88],
+    [0.95, 0.64, 0.54],
+    [0.80, 0.55, 0.34],
+    [0.56, 0.57, 0.58],
+    [0.97, 0.70, 0.60],
+    [0.91, 0.78, 0.42],
+    [0.52, 0.56, 0.70],
+];
+
+/// A studio around the picture, as a metal sees it: the brightness reflected along `rr` (a unit vector, screen x right, y down, z out), a bright sky above falling smoothly to a dim floor below, and a soft-box at the key lamp `l`.
+#[inline]
+fn studio(rr: (f32, f32, f32), l: (f32, f32, f32)) -> f32 {
+    let sky = 0.5 - 0.5 * (3. * rr.1).tanh();
+    let lamp = positive_part(rr.0 * l.0 + rr.1 * l.1 + rr.2 * l.2).powi(1 << 5);
+    0.0625 + 0.5 * sky + 1.5 * lamp
+}
+
+/// A metal of colour `base` (linear) with unit normal `n`, lit by the studio: the view straight down the z axis reflected about n, tinted by the metal, in linear light.
+#[inline]
+fn metal(base: [f32; 3], n: (f32, f32, f32), l: (f32, f32, f32)) -> [f32; 3] {
+    let rr = (2. * n.2 * n.0, 2. * n.2 * n.1, 2. * n.2 * n.2 - 1.);
+    let e = studio(rr, l);
+    base.map(|b| b * e)
+}
+
+/// Linear light to display, through the exposure curve 1 − e^(−c) (C∞, every brightness lands below white, highlights roll off instead of clipping), then gamma 2.
+#[inline]
+fn expose(lin: [f32; 3]) -> [f32; 3] {
+    lin.map(|c| (1. - (-c).exp()).sqrt())
+}
+
+/// A unit vector.
+#[inline]
+fn unit3(v: (f32, f32, f32)) -> (f32, f32, f32) {
+    let l = (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt();
+    (v.0 / l, v.1 / l, v.2 / l)
+}
+
 /// The look's tweaks, applied at render time: `offset` is a complex offset of the colouring coordinate (see `shade`); `light` is the direction the disc is lit from, (x right, y down, z toward the viewer), normalised by the renderer.
 #[derive(Clone, Copy)]
 pub struct Look {
@@ -851,12 +907,16 @@ pub struct Look {
     pub material: Pick,
     pub engrave: Pick,
     pub mirror: Pick,
+    /// How the picture is made (see `Attest::style`): 0 soft colours, 1 medal, 2 enamel, 3 lacquer.
+    pub style: Pick,
+    /// Wrap the picture as a round button: a metal bezel, a glass dome over the picture, the bezel's shadow inside and a drop shadow outside.
+    pub button: bool,
 }
 
 impl Default for Look {
     /// Photon's avatar: no offset, the device's own relief and lighting, √(1 − |p|²), no attest features.
     fn default() -> Self {
-        Look { offset: (0., 0.), relief: 1., fixed_light: false, vignette: 2, material: Pick::Off, engrave: Pick::Off, mirror: Pick::Off }
+        Look { offset: (0., 0.), relief: 1., fixed_light: false, vignette: 2, material: Pick::Off, engrave: Pick::Off, mirror: Pick::Off, style: Pick::Off, button: false }
     }
 }
 
@@ -866,9 +926,9 @@ impl Look {
         Look::default()
     }
 
-    /// ferros's attest mark: √(1 − |p|¹²), and every attest feature as the device drew it.
+    /// ferros's attest mark: √(1 − |p|¹²), every attest feature as the device drew it, wrapped as a button.
     pub fn attest() -> Self {
-        Look { vignette: 12, material: Pick::Device, engrave: Pick::Device, mirror: Pick::Device, ..Look::default() }
+        Look { vignette: 12, material: Pick::Device, engrave: Pick::Device, mirror: Pick::Device, style: Pick::Device, button: true, ..Look::default() }
     }
 }
 
@@ -964,50 +1024,98 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
     // Lightness and saturation: the ground's, moving to the body's on the set and the edge's around it, settling back to the ground far out; the slope's shading on top, everywhere it tilts.
     let lightness = th.ground_l + (th.body_l - th.ground_l) * body + (th.rim_l - th.ground_l) * edge * (1. - far) + shading + breathe;
     let sat = th.ground_s + (th.body_s - th.ground_s) * body + (th.rim_s - th.ground_s) * edge * (1. - far);
-    // The engraving (attest): hairlines `hair` pixels wide, inked or glowing as the theme's edge is, on the level lines of the potential and on the rays, both read where the orbit first passed 2⁸ (see `Orbit`), so each level's rays meet the next level's twice as many exactly on a level line.
-    // A line's distance in pixels is its coordinate's distance to the nearest whole number over the coordinate's change per pixel, with |sin(πx)|/π standing in for that distance (C∞, and the same near a line); each family fades in as its lines get more than 2³ hairs apart, so they never crowd into hatching near the set.
+    // How the picture is made: soft colours (the avatars'), a medal, or enamel (see `Attest::style`).
+    let style = look.style.of(v.attest.style);
+    // The engraving (attest): hairlines `hair` pixels wide on the level lines of the potential and on the rays, both read where the orbit first passed 2⁸ (see `Orbit`), so each level's rays meet the next level's twice as many exactly on a level line. Enamel needs its wires, so a device with no engraving gets level lines there.
+    // A line's distance in pixels is its coordinate's distance to the nearest whole number over the coordinate's change per pixel, with |sin(πx)|/π standing in for that distance (C∞, and the same near a line); each family fades in as its lines get more than 2³ hairs apart (`apart`), so they never crowd into hatching near the set.
     let engrave = look.engrave.of(v.attest.engrave);
-    let line = if escaped && engrave != 0 {
-        let pi = std::f32::consts::PI;
-        let ink = |x: f32, per_px: f32| {
-            let spacing = 1. / per_px;
-            let d = (pi * x).sin() / (pi * per_px * hair);
-            let crowd = 8.;
-            (-(d * d)).exp2() * spacing * spacing / (spacing * spacing + crowd * crowd * hair * hair)
-        };
-        let levels = if engrave & 1 == 1 { let m = v.attest.levels; ink(o.lv * m, m / (std::f32::consts::LN_2 * dist_px)) } else { 0. };
-        let rays = if engrave & 2 == 2 { let n = v.attest.rays; ink(o.ray * n, n * o.ln_turn.exp() * k / tau) } else { 0. };
+    let engrave = if style == 2 && engrave == 0 { 1 } else { engrave };
+    let pi = std::f32::consts::PI;
+    let (m_lv, n_ray) = (v.attest.levels, v.attest.rays);
+    let lv_px = m_lv / (std::f32::consts::LN_2 * dist_px);
+    let ray_px = n_ray * o.ln_turn.exp() * k / tau;
+    let apart = |per_px: f32| {
+        let s = 1. / per_px;
+        let crowd = 8. * hair;
+        s * s / (s * s + crowd * crowd)
+    };
+    let ink = |x: f32, per_px: f32| {
+        let d = (pi * x).sin() / (pi * per_px * hair);
+        (-(d * d)).exp2() * apart(per_px)
+    };
+    let line = if escaped {
+        let levels = if engrave & 1 == 1 { ink(o.lv * m_lv, lv_px) } else { 0. };
+        let rays = if engrave & 2 == 2 { ink(o.ray * n_ray, ray_px) } else { 0. };
         1. - (1. - levels) * (1. - rays)
     } else {
         0.
     };
-    // A line moves the lightness 2⁻³ the way the theme's edge goes from its ground (ink darker, glow lighter) and takes the edge's saturation.
-    let way = if th.rim_l > th.ground_l { 1. } else { -1. };
-    let lightness = lightness + way * 0.125 * line;
-    let sat = sat + (th.rim_s - sat) * line;
-    // Hue: the ground's base, drifting toward the far field, swung by the colouring, turned by the nacre, and turned by the theme's accent on the set.
-    let rgb = soft(th, lightness, sat, th.spread * swing + th.drift * far + nacre + th.accent * body, tint);
-    // The material (attest): a highlight of the key lamp on the ball, its normal the sphere's (`sphere`, screen x right, y down, z out) tilted by the relief's slope, and for glass a Fresnel sheen toward the rim. Added as a screen blend, c + s·(1 − c), so it brightens without clipping.
-    let material = look.material.of(v.attest.material);
-    let rgb = if material == 0 {
-        rgb
-    } else {
-        // The relief's horizontal tilt, from the plane back to the screen (the conjugate of the view's turn).
-        let (px, py) = if julia { (sin_a * o.ux, sin_a * o.uy) } else { (0., 0.) };
-        let (rx, ry) = (px * v.rot.0 + py * v.rot.1, -px * v.rot.1 + py * v.rot.0);
-        let n = (sphere.0 + rx * 0.25, sphere.1 + ry * 0.25, sphere.2);
-        let nl = (n.0 * n.0 + n.1 * n.1 + n.2 * n.2).sqrt();
-        let n = (n.0 / nl, n.1 / nl, n.2 / nl);
-        let l = { let d = lt.key.dir; (d.0 * turn.1 - d.1 * turn.0, d.0 * turn.0 + d.1 * turn.1, d.2) };
-        let h = (l.0, l.1, l.2 + 1.);
-        let hl = (h.0 * h.0 + h.1 * h.1 + h.2 * h.2).sqrt();
-        let nh = positive_part((n.0 * h.0 + n.1 * h.1 + n.2 * h.2) / hl);
-        let spec = match material {
-            1 => 0.25 * nh.powi(1 << 3),
-            2 => 0.125 * nh.powi(1 << 3) + 0.75 * nh.powi(1 << 6),
-            _ => 0.875 * nh.powi(1 << 8) + 0.375 * (1. - n.2).powi(1 << 2),
-        };
-        rgb.map(|c| c + spec * (1. - c))
+    // The surface for the attest styles, in screen terms: the relief's horizontal tilt brought back from the plane (the conjugate of the view's turn), and the key lamp turned by the key.
+    let (px, py) = if julia { (sin_a * o.ux, sin_a * o.uy) } else { (0., 0.) };
+    let (rx, ry) = (px * v.rot.0 + py * v.rot.1, -px * v.rot.1 + py * v.rot.0);
+    let l = { let d = lt.key.dir; (d.0 * turn.1 - d.1 * turn.0, d.0 * turn.0 + d.1 * turn.1, d.2) };
+    let half = unit3((l.0, l.1, l.2 + 1.));
+    let facing = |n: (f32, f32, f32)| positive_part(n.0 * half.0 + n.1 * half.1 + n.2 * half.2);
+    // How raised the set stands for the metal styles: 1 on it, falling smoothly (C∞) to nothing about 2 hairs out, a width in the picture's own terms, so a dense whorl still shows its field between the dust.
+    let raised = { let d = dist_px / (2. * hair); 1. / (1. + d * d) };
+    let rgb = match style {
+        0 => {
+            // A line moves the lightness 2⁻³ the way the theme's edge goes from its ground (ink darker, glow lighter) and takes the edge's saturation.
+            let way = if th.rim_l > th.ground_l { 1. } else { -1. };
+            let lightness = lightness + way * 0.125 * line;
+            let sat = sat + (th.rim_s - sat) * line;
+            // Hue: the ground's base, drifting toward the far field, swung by the colouring, turned by the nacre, and turned by the theme's accent on the set.
+            let rgb = soft(th, lightness, sat, th.spread * swing + th.drift * far + nacre + th.accent * body, tint);
+            // The material (attest): a highlight of the key lamp on the ball, its normal the sphere's (`sphere`, screen x right, y down, z out) tilted by a quarter of the relief's slope, and for glass a Fresnel sheen toward the rim. Added as a screen blend, c + s·(1 − c), so it brightens without clipping.
+            let material = look.material.of(v.attest.material);
+            if material == 0 {
+                rgb
+            } else {
+                let n = unit3((sphere.0 + rx * 0.25, sphere.1 + ry * 0.25, sphere.2));
+                let nh = facing(n);
+                let spec = match material {
+                    1 => 0.25 * nh.powi(1 << 3),
+                    2 => 0.125 * nh.powi(1 << 3) + 0.75 * nh.powi(1 << 6),
+                    _ => 0.875 * nh.powi(1 << 8) + 0.375 * (1. - n.2).powi(1 << 2),
+                };
+                rgb.map(|c| c + spec * (1. - c))
+            }
+        }
+        1 => {
+            // A medal: the relief struck in metal on a faintly domed field (a quarter of the ball's curve), the set raised in `metal_a` and the field in `metal_b` (one metal or two), the engraving cut in as darker grooves.
+            let n = unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, 1.));
+            let (a, b) = (METALS[v.attest.metal_a as usize], METALS[v.attest.metal_b as usize]);
+            let base = [0, 1, 2].map(|i| b[i] + (a[i] - b[i]) * raised);
+            expose(metal(base, n, l).map(|c| c * (1. - 0.5 * line)))
+        }
+        2 => {
+            // Enamel (cloisonné): each cell between the engraving's lines filled with one of four colours around the theme's hue (richer than the avatars' but held under the same gamut cap), the set's dust and the wires in `metal_a`, all under a glossy glaze.
+            // A cell's colour comes from a hash of its level and ray indices; where the cells crowd near the set (as their lines fade) the colours fade to the first of the four, the theme's own hue, so they never speckle.
+            let cl = (o.lv * m_lv).floor() as i32;
+            let cr = if engrave & 2 == 2 { (o.ray * n_ray).floor() as i32 } else { 0 };
+            let which = (jitter(cl as u32, cr as u32, v.attest.cells).0 * 4.) as usize;
+            let lift = (th.ground_l - 0.67) * 0.5;
+            let pal = [(0.62, 0.), (0.52, tau / 3.), (0.72, -tau / 3.), (0.44, tau / 2.)].map(|(pl, dh)| soft(th, pl + lift, 0.15, dh, (0., 0.)).map(|c| c * c * 1.25));
+            let fade = if escaped { apart(lv_px) * if engrave & 2 == 2 { apart(ray_px) } else { 1. } } else { 0. };
+            let cell = [0, 1, 2].map(|i| pal[0][i] + (pal[which][i] - pal[0][i]) * fade);
+            let n = unit3((sphere.0 * 0.5 + rx, sphere.1 * 0.5 + ry, 1.));
+            let gold = metal(METALS[v.attest.metal_a as usize], n, l);
+            let w = 1. - (1. - raised) * (1. - line);
+            let lin = [0, 1, 2].map(|i| cell[i] + (gold[i] - cell[i]) * w);
+            // The glaze: a glossy highlight on the ball's own curve.
+            let spec = 0.625 * facing(unit3(sphere)).powi(1 << 6);
+            expose(lin).map(|c| c + spec * (1. - c))
+        }
+        _ => {
+            // Lacquer: the avatars' own colouring, a step darker and twice as saturated (the gamut cap in `soft` still holds it), the engraving inked in, the set raised in `metal_a`, under the same glaze as enamel.
+            let way = if th.rim_l > th.ground_l { 1. } else { -1. };
+            let lacquer = soft(th, lightness * 0.75 + way * 0.125 * line, sat * 2., th.spread * swing + th.drift * far + nacre + th.accent * body, tint).map(|c| c * c * 1.25);
+            let n = unit3((sphere.0 * 0.5 + rx, sphere.1 * 0.5 + ry, 1.));
+            let gold = metal(METALS[v.attest.metal_a as usize], n, l);
+            let lin = [0, 1, 2].map(|i| lacquer[i] + (gold[i] - lacquer[i]) * raised);
+            let spec = 0.625 * facing(unit3(sphere)).powi(1 << 6);
+            expose(lin).map(|c| c + spec * (1. - c))
+        }
     };
     (rgb, dist_px)
 }
@@ -1060,13 +1168,10 @@ pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Para
 
 /// As `render_disc`, returning how many pixels took each number of samples (index = samples taken; pixels outside the disc are not counted).
 pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) -> Vec<u64> {
-    let mut v = p.view();
-    // Mirrored (attest): the conjugate picture, J(c̄) about the eye's conjugate turned the other way, which is this one flipped top to bottom with its whorl turning the other way; the lamps stay where they are.
-    if look.mirror.of(v.attest.mirror as u8) == 1 {
-        v.c.1 = -v.c.1;
-        v.centre.1 = -v.centre.1;
-        v.rot.1 = -v.rot.1;
+    if look.button {
+        return render_button(buf, w, cx, cy, r, p, look);
     }
+    let v = mirrored(p.view(), look);
     // The engraving's hairline: 2⁻⁷ of the disc's radius.
     let hair = r * (1. / (1 << 7) as f32);
     let rad = p.radius as f32;
@@ -1130,6 +1235,154 @@ pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, 
             hist
         })
         .reduce(|| vec![0u64; MAX_SAMPLES + 1], |a, b| a.iter().zip(&b).map(|(x, y)| x + y).collect())
+}
+
+/// The button's bezel: its outer edge at 2⁻³ in from the disc's (the drop shadow fills the rest), 2⁻³ of the disc's radius wide; the picture sits inside it.
+const BEZEL_OUT: f32 = 1. - 1. / (1 << 3) as f32;
+const BEZEL_IN: f32 = BEZEL_OUT - 1. / (1 << 3) as f32;
+
+/// The logistic 1/(1 + e^(−x)), C∞.
+#[inline]
+fn logistic(x: f32) -> f32 {
+    1. / (1. + (-x).exp())
+}
+
+/// The mark as a round button (attest), in a disc of radius `r` pixels centred at (`cx`, `cy`): four faux layers, from the bottom up.
+/// A drop shadow, cast down and away from the key lamp, out to the disc's own edge (where it has faded to nothing, smoothly, as 1 − s¹⁶).
+/// A metal bezel in `metal_b`, its cross-section a half-round, a double ring, or a half-round reeded across with 2⁷ fine ridges (as a coin's edge), lit by the same studio as the medal.
+/// The picture inside it, spherized as `render_disc` does, with the bezel's shadow falling across its edge on the lamp's side.
+/// A glass dome over the picture: a sharp highlight of the key lamp and a broad soft one.
+/// Every layer is opaque but the shadow, so samples are averaged with their coverage (premultiplied, in linear light); pixels across the bezel's two edges take at least 2³ samples, since a sharp circle can fall between two jittered samples on one side.
+fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) -> Vec<u64> {
+    let v = mirrored(p.view(), look);
+    let r_pic = r * BEZEL_IN;
+    let hair = r_pic * (1. / (1 << 7) as f32);
+    let rad = p.radius as f32;
+    let fixed = Lighting::fixed();
+    let lt = if look.fixed_light { &fixed } else { &v.theme.lighting };
+    let turn = (TAU as f32 * v.keyed.light_turn).sin_cos();
+    let l = { let d = lt.key.dir; (d.0 * turn.1 - d.1 * turn.0, d.0 * turn.0 + d.1 * turn.1, d.2) };
+    let lh = { let m = (l.0 * l.0 + l.1 * l.1).sqrt(); (l.0 / m, l.1 / m) };
+    let half = unit3((l.0, l.1, l.2 + 1.));
+    let facing = |n: (f32, f32, f32)| positive_part(n.0 * half.0 + n.1 * half.1 + n.2 * half.2);
+    let bezel_metal = METALS[v.attest.metal_b as usize];
+    let pi = std::f32::consts::PI;
+    // One sample at (dx, dy) pixels from the centre: its colour (display gamma) and its coverage.
+    let sample = |dx: f32, dy: f32| -> ([f32; 3], f32) {
+        let (sx, sy) = (dx / r, dy / r);
+        let s2 = sx * sx + sy * sy;
+        if s2 >= 1. {
+            return ([0.; 3], 0.);
+        }
+        let s = s2.sqrt();
+        if s >= BEZEL_OUT {
+            // The drop shadow: a disc the bezel's size, moved half the margin away from the lamp, its edge softened over about 2⁻⁵ of the radius.
+            let off = (1. - BEZEL_OUT) * 0.5;
+            let (ox, oy) = (sx + lh.0 * off, sy + lh.1 * off);
+            let so = (ox * ox + oy * oy).sqrt();
+            let a = 0.5 * logistic((BEZEL_OUT - so) * (1 << 5) as f32) * (1. - s2.powi(1 << 3));
+            return ([0.; 3], a);
+        }
+        if s >= BEZEL_IN {
+            // The bezel: t across it from the picture's edge (0) to its own (1); the cross-section's height h(t) in bezel widths and its slope dh/dx, and the surface normal leaning down the slope (inward where the height rises outward).
+            let t = (s - BEZEL_IN) / (BEZEL_OUT - BEZEL_IN);
+            let (ux, uy) = (sx / s, sy / s);
+            let slope = match v.attest.bezel {
+                // A double ring: h = ¼·sin²(2πt), two rounded ridges.
+                2 => 0.5 * pi * (4. * pi * t).sin(),
+                // A half-round: h = ½·sin(πt).
+                _ => 0.5 * pi * (pi * t).cos(),
+            };
+            // Reeding: ridges across the bezel, 2⁷ around, as a tangential lean of ±⅓; they fade as they crowd below 2³ hairs apart, so a small button shows a plain bezel.
+            let reed = if v.attest.bezel == 1 {
+                let around = (1 << 7) as f32;
+                let spacing = TAU as f32 * s * r / around;
+                let crowd = 8. * hair;
+                (1. / 3.) * (around * sy.atan2(sx)).sin() * spacing * spacing / (spacing * spacing + crowd * crowd)
+            } else {
+                0.
+            };
+            let n = unit3((-slope * ux - reed * uy, -slope * uy + reed * ux, 1.));
+            // The crease where the bezel meets the picture is shadowed: dark at t = 0, gone by t ≈ 2⁻².
+            let crease = 1. - 0.5 * (-(t * 8.) * (t * 8.)).exp2();
+            return (expose(metal(bezel_metal, n, l).map(|c| c * crease)), 1.);
+        }
+        // The picture, spherized inside the bezel.
+        let (qx, qy) = (sx / BEZEL_IN, sy / BEZEL_IN);
+        let q2 = qx * qx + qy * qy;
+        let g = rad / (1. - q2).sqrt();
+        let (a, b) = (qx * g, qy * g);
+        let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
+        let k = rad / (r_pic * (1. - q2));
+        let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
+        let sphere = (qx, qy, (1. - q2).sqrt());
+        let c = shade(x, y, &v, k, look, sphere, hair).0;
+        // The bezel's shadow: on the side toward the lamp the bezel's wall shades the picture's edge, over about 2⁻³ of the picture's radius.
+        let toward = positive_part(qx * lh.0 + qy * lh.1);
+        let edge = 1. - q2.sqrt();
+        let shadow = 1. - 0.75 * toward * (-(edge * 8.) * (edge * 8.)).exp2();
+        // The glass dome, flatter than the ball (half its curve): a sharp highlight and a broad soft one, added as a screen blend.
+        let nh = facing(unit3((qx * 0.5, qy * 0.5, 1.)));
+        let spec = 0.5 * nh.powi(1 << 7) + 0.125 * nh.powi(1 << 3);
+        (c.map(|c| c * taper * shadow + spec * (1. - c * taper * shadow)), 1.)
+    };
+    let (e_out, e_in) = (r * BEZEL_OUT, r * BEZEL_IN);
+    buf.par_chunks_mut(w)
+        .enumerate()
+        .map(|(py, row)| {
+            let mut hist = vec![0u64; MAX_SAMPLES + 1];
+            for px in 0..w {
+                let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+                let d = (dx * dx + dy * dy).sqrt();
+                if d >= r + 1. {
+                    row[px] = 0;
+                    continue;
+                }
+                // Across one of the bezel's edges: at least 2³ samples.
+                let least = if (d - e_out).abs() < 1. || (d - e_in).abs() < 1. { 1 << 3 } else { 2 };
+                // Linear-light sums, premultiplied by coverage, and the coverage's sum.
+                let mut sum = [0f32; 3];
+                let mut cover = 0f32;
+                let mut m = 0usize;
+                loop {
+                    let (jx, jy) = jitter(px as u32, py as u32, m as u32);
+                    let (s, a) = sample(px as f32 + jx - cx, py as f32 + jy - cy);
+                    // The newest sample against the mean of the ones before it, premultiplied, in 8-bit display levels (coverage counted as a fourth channel).
+                    let spread = if m == 0 {
+                        f32::MAX
+                    } else {
+                        let ma = cover / m as f32;
+                        let mean = sum.map(|c| (c / m as f32).sqrt());
+                        let now = s.map(|c| c * a.sqrt());
+                        (0..3).map(|i| (now[i] - mean[i]).abs() * 255.).fold((a - ma).abs() * 255., f32::max)
+                    };
+                    for i in 0..3 {
+                        sum[i] += s[i] * s[i] * a;
+                    }
+                    cover += a;
+                    m += 1;
+                    let threshold = m as f32;
+                    if m >= MAX_SAMPLES || (m >= least && spread <= threshold) {
+                        break;
+                    }
+                }
+                hist[m] += 1;
+                let rgb = if cover > 0. { sum.map(|c| (c / cover).sqrt()) } else { [0.; 3] };
+                row[px] = pack(rgb, cover / m as f32);
+            }
+            hist
+        })
+        .reduce(|| vec![0u64; MAX_SAMPLES + 1], |a, b| a.iter().zip(&b).map(|(x, y)| x + y).collect())
+}
+
+/// The view as the look shows it: mirrored (attest) is the conjugate picture, J(c̄) about the eye's conjugate turned the other way, which is the plain one flipped top to bottom with its whorl turning the other way; the lamps stay where they are.
+fn mirrored(mut v: View, look: &Look) -> View {
+    if look.mirror.of(v.attest.mirror as u8) == 1 {
+        v.c.1 = -v.c.1;
+        v.centre.1 = -v.centre.1;
+        v.rot.1 = -v.rot.1;
+    }
+    v
 }
 
 /// Where this picture came from in the Mandelbrot set: the Julia set's c.
