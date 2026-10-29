@@ -1,0 +1,11 @@
+[package]
+name = "tapuwae"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A recognisable mark from a hash: the root spiral of a Julia set placed by a descent onto the Mandelbrot set's skyline, spherized into a softly lit disc. Used for ferros's attest screen and Photon's default avatars."
+repository = "https://github.com/nickspiker/tapuwae"
+
+[dependencies]
+blake3 = "1"
+rayon = "1"
