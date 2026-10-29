@@ -1467,110 +1467,71 @@ fn mirrored(mut v: View, look: &Look) -> View {
     v
 }
 
-/// The fresh mark (attest, a device no identity has attested on yet): the Mandelbrot set itself, antenna up, filling a disc of radius `r` pixels centred at (`cx`, `cy`), in the device's colour, with the device's own Julia set inside every hyperbolic component; everything from `salt` (the device's own, from its ira).
-/// Outside is black, with a glow from the distance estimate shaped as ferros's circles glow (`render_button`): the set's line at full light, a halo at half, down by the same step every octave of distance, gone 1/GLOW_FRACTION of `r` out.
+/// The fresh mark (attest, a device no identity has attested on yet): the Mandelbrot set itself, antenna up, filling a disc of radius `r` pixels centred at (`cx`, `cy`), in the device's colour, with the device's attest ball inside every hyperbolic component; everything from `salt` (the device's own, from its ira), and the ball also from `text`, the textbox, as the attest ball follows it (each character nudging it, `Params::new`).
+/// Outside is black, with a glow from the distance estimate shaped as ferros's circles glow (`render_button`): the set's line at full light, a halo at half, down by the same step every octave of distance, gone 1/GLOW_FRACTION of `r` out. It never depends on the text.
 /// Inside, a component is a disc to its multiplier λ (the attracting cycle's (fᵖ)′, a conformal map of the component onto the unit disc, 0 at its centre and of size 1 on its rim): the main cardioid and the period-2 disc have it in closed form (1 − √(1 − 4c) and 4(c + 1)); every other point iterates 2⁹ steps to settle, then finds its cycle (the first return within 2⁻²⁰) and multiplies 2z around it.
-/// The disc shows the device's Julia set (c from the salt by the same descent the attest balls are placed with, its landing point on the set), spherized as the balls are (z = R·λ/√(1 − |λ|²), the Julia plane's infinity on the rim), coloured exactly as the Mandelbrot set is: its line and halo by its own distance estimate (in units of the disc, so every component's copy glows in proportion), its inside by its contraction.
-/// Toward the rim the Julia picture gives way to the rim's own shade (lightness 0.12 + 0.6·u⁴ for u = |λ|^(1/p), the cycle's contraction a step, weighted by u⁸), which meets the line outside at the same colour, so every component's edge blends into the Mandelbrot set's. Where no cycle is found within 2⁶ steps (near a rim, converging slowly) the rim's shade stands alone, from the Lyapunov exponent.
+/// The disc is the attest ball's disc, point for point: the same view, `shade` and `Look::attest()` (style, material, engraving, mirror, electric flame), tapering by the vignette into the device's colour at the rim, which is the colour of the set's line outside, so every component blends into the outline. The ball's scale in pixels is the component's: its radius is 1/|dλ/dpixel| (in closed form for the cardioid and the period-2 disc, |λ′| = 2/|√(1 − 4c)| and 4; elsewhere λ again half a pixel along and the difference), and its lines are 2⁻⁷ of that, as the ball's are of its own.
+/// Where no cycle is found within 2⁶ steps (right at a rim, converging slowly, or a period past 2⁶) the device's colour stands, as the ball's rim does.
+/// `inside` is a bitmask of the pixels (one bit per pixel of `buf`, 64 a word, row after row) that hold any of a component: with `full` every pixel renders and the mask is written; without, only the masked pixels render, so a new `text` redraws the balls and leaves the outline as it was.
 /// Sampling: a `k` × `k` stratified grid per pixel, averaged in linear light with coverage (the glow is light over the background, coverage its brightness).
-pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], k: u32) {
+pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], text: &str, k: u32, inside: &mut [u64], full: bool) {
     let th = Theme::from_bytes(&draw(salt, 1, 0, &[]));
     let aura = soft(&th, 0.72, 0.15, 0., (0., 0.));
-    // The device's Julia set: the descent from x (as `Params::new_placed`, slanted toward the right), its landing point as c, and half the set's half-extent as the spherize's radius, so the set reaches about 0.87 of the way to a component's rim.
-    let (cj, rj) = {
-        let x = -2. + unit(&draw(salt, 16, 0, &[])[0..4]).sqrt() * (X_RIGHT + 2.);
-        let (land, _, _) = descend(x);
-        ((land.0 as f32, land.1 as f32), (j_extent(land) * 0.5) as f32)
-    };
+    // The attest ball, as `render_button` draws it.
+    let look = Look::attest();
+    let params = Params::new(salt, text);
+    let v = mirrored(params.view(), &look);
+    let rad = params.radius as f32;
     // The set from Re −2 to 0.4713 and Im ±1.1225, centred on Re −0.764: half its length plus the glow's reach fills the disc.
     let centre = -0.764f32;
     let scale = 1.2357 * (1. + 1. / GLOW_FRACTION) / r;
     let reach = r / GLOW_FRACTION;
     let octaves = (1 << GLOW_OCTAVES_LOG2) as f32;
-    // A distance d past an edge, in units where the glow reaches `reach` and the line is `line_w` wide: the line at full light and the halo at half (the light, coverage over black).
+    // A distance d (pixels) past the set's edge: its line at full light and the halo at half (the light, coverage over black).
     // WHY the floor of 2⁻⁸ of the reach: d is exactly 0 where the derivative overflowed (on the set), and log₂ 0 is −∞; the floor holds the glow at full there, 2⁴ times inside where it is already full.
-    let glow = |d: f32, reach: f32, line_w: f32| -> f32 {
+    let glow = |d: f32| -> f32 {
         let u = 1. + ((d + reach * (1. / (1 << 8) as f32)) / reach).log2() / octaves;
-        let line = (-(d / line_w) * (d / line_w)).exp2();
+        let line = (-(d * d)).exp2();
         line + (1. - line) * 0.5 * (positive_part(1. - u) - positive_part(-u))
     };
-    // The inside's shade at contraction u.
-    let shade_in = |u: f32| -> [f32; 3] {
-        let u4 = (u * u) * (u * u);
-        soft(&th, 0.12 + 0.6 * u4, 0.15, 0., (0., 0.))
-    };
-    // The Julia picture at a component's λ, opaque (display colour over black): the same line, halo and inside as the Mandelbrot set's, the distance taken back into units of the disc (the spherize stretches the plane by R/(1 − |λ|²) there).
-    let julia = |lam: (f32, f32)| -> [f32; 3] {
-        let l2 = lam.0 * lam.0 + lam.1 * lam.1;
-        let g = rj / (1. - l2).sqrt();
-        let mut z = (lam.0 * g, lam.1 * g);
-        let (mut dm, mut dm_exp, mut lyap) = (1f32, 0i32, 0f32);
-        let settle = 1u32 << 8;
-        for n in 0..settle + (1 << 5) {
-            let r2 = z.0 * z.0 + z.1 * z.1;
-            if r2 > BAIL_SQ_F32 {
-                let rz = r2.sqrt();
-                let d = rz * rz.ln() / dm * (-(dm_exp as f32)).exp2() * (1. - l2) / rj;
-                let light = glow(d, 1. / GLOW_FRACTION, 1. / (GLOW_FRACTION * (1 << 4) as f32));
-                return aura.map(|a| a * light.sqrt());
-            }
-            if n >= settle {
-                lyap += (4. * r2).ln() * 0.5;
-            }
-            dm *= 2. * r2.sqrt();
-            if dm > (1u64 << 63) as f32 * 2. {
-                dm *= 1. / ((1u64 << 63) as f32 * 2.);
-                dm_exp += 64;
-            }
-            z = (z.0 * z.0 - z.1 * z.1 + cj.0, 2. * z.0 * z.1 + cj.1);
+    // The ball at disc point p (x right, y down, as the ball's own) for a component `r_pic` pixels in radius.
+    let ball = |p: (f32, f32), r_pic: f32| -> [f32; 3] {
+        let q2 = p.0 * p.0 + p.1 * p.1;
+        // On the rim the warp is infinite and the taper 0: the device's colour.
+        if q2 >= 1. {
+            return aura;
         }
-        shade_in((lyap * (1. / (1 << 5) as f32)).exp())
+        let g = rad / (1. - q2).sqrt();
+        let (a, b) = (p.0 * g, p.1 * g);
+        let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
+        let kk = rad / (r_pic * (1. - q2));
+        let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
+        let c = shade(x, y, &v, kk, &look, (p.0, p.1, (1. - q2).sqrt()), r_pic * (1. / (1 << 7) as f32)).0;
+        [0, 1, 2].map(|i| aura[i] + (c[i] - aura[i]) * taper)
     };
-    // A component's point with multiplier λ and contraction u: the Julia picture giving way to the rim's shade by u⁸.
-    let inside = |lam: (f32, f32), u: f32| -> ([f32; 3], f32) {
-        let j = julia(lam);
-        let rim = shade_in(u);
-        let u8 = { let u2 = u * u; let u4 = u2 * u2; u4 * u4 };
-        ([0, 1, 2].map(|i| j[i] + (rim[i] - j[i]) * u8), 1.)
-    };
-    // One sample at (dx, dy) pixels from the centre: its colour (display gamma) and coverage. Up the screen is toward Re −2 (the antenna), right is +Im.
-    let sample = |dx: f32, dy: f32| -> ([f32; 3], f32) {
-        let c = (centre + dy * scale, dx * scale);
-        // The main cardioid and the period-2 disc, in closed form.
-        let (xq, y2) = (c.0 - 0.25, c.1 * c.1);
-        let q = xq * xq + y2;
-        if q * (q + xq) < 0.25 * y2 {
-            // λ = 1 − √(1 − 4c): the principal square root of (1 − 4c), by halves.
-            let (ax, ay) = (1. - 4. * c.0, -4. * c.1);
-            let m = (ax * ax + ay * ay).sqrt();
-            let (sx, sy) = (((m + ax) * 0.5).sqrt(), ((m - ax) * 0.5).sqrt());
-            let sy = if ay < 0. { -sy } else { sy };
-            let lam = (1. - sx, -sy);
-            return inside(lam, (lam.0 * lam.0 + lam.1 * lam.1).sqrt());
-        }
-        if (c.0 + 1.) * (c.0 + 1.) + y2 < 1. / 16. {
-            let lam = (4. * (c.0 + 1.), 4. * c.1);
-            return inside(lam, (lam.0 * lam.0 + lam.1 * lam.1).sqrt().sqrt());
-        }
-        // Everything else iterates: z from 0 and its derivative's magnitude (rescaled by 2⁻⁶⁴ past 2⁶⁴, as `orbit`); after 2⁹ steps, the cycle's search: the product of 2z since the settled point, the first return to it, and the sum of ln|2z| for the Lyapunov exponent.
-        let (mut z, mut dm, mut plus, mut dm_exp, mut lyap) = ((0f32, 0f32), 0f32, 1f32, 0i32, 0f32);
+    // λ as the ball's disc point: (Im λ, Re λ), so in the main cardioid, where λ ≈ 2c near its centre, the ball stands as the screen does (right is +Im, down is +Re).
+    let disc = |lam: (f32, f32)| (lam.1, lam.0);
+    // A point of the parameter plane: escaped (its distance in pixels), inside a component found (λ), or neither within the search.
+    enum Pt {
+        Out(f32),
+        In((f32, f32)),
+        Slow,
+    }
+    let probe = |c: (f32, f32)| -> Pt {
+        let (mut z, mut dm, mut plus, mut dm_exp) = ((0f32, 0f32), 0f32, 1f32, 0i32);
         let settle = 1u32 << 9;
-        let (mut zs, mut lam, mut found) = ((0f32, 0f32), (1f32, 0f32), 0u32);
+        let (mut zs, mut lam) = ((0f32, 0f32), (1f32, 0f32));
         for n in 0..settle + (1 << 6) {
             let r2 = z.0 * z.0 + z.1 * z.1;
             if r2 > BAIL_SQ_F32 {
                 let rz = r2.sqrt();
-                let d = rz * rz.ln() / dm * (-(dm_exp as f32)).exp2() / scale;
-                return (aura, glow(d, reach, 1.));
+                return Pt::Out(rz * rz.ln() / dm * (-(dm_exp as f32)).exp2() / scale);
             }
             if n == settle {
                 zs = z;
             }
             if n >= settle {
-                lyap += (4. * r2).ln() * 0.5;
-                if found == 0 {
-                    lam = (2. * (lam.0 * z.0 - lam.1 * z.1), 2. * (lam.0 * z.1 + lam.1 * z.0));
-                }
+                lam = (2. * (lam.0 * z.0 - lam.1 * z.1), 2. * (lam.0 * z.1 + lam.1 * z.0));
             }
             dm = 2. * r2.sqrt() * dm + plus;
             if dm > (1u64 << 63) as f32 * 2. {
@@ -1580,18 +1541,44 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
                 dm_exp += 64;
             }
             z = (z.0 * z.0 - z.1 * z.1 + c.0, 2. * z.0 * z.1 + c.1);
-            if n >= settle && found == 0 {
+            if n >= settle {
                 let (ex, ey) = (z.0 - zs.0, z.1 - zs.1);
                 if ex * ex + ey * ey < 1. / (1u32 << 20) as f32 {
-                    found = n + 1 - settle;
+                    return Pt::In(lam);
                 }
             }
         }
-        let u = (lyap * (1. / (1 << 6) as f32)).exp();
-        if found > 0 {
-            inside(lam, u)
-        } else {
-            (shade_in(u), 1.)
+        Pt::Slow
+    };
+    // One sample at (dx, dy) pixels from the centre: its colour (display gamma), coverage, and whether it fell inside a component. Up the screen is toward Re −2 (the antenna), right is +Im.
+    let sample = |dx: f32, dy: f32| -> ([f32; 3], f32, bool) {
+        let c = (centre + dy * scale, dx * scale);
+        // The main cardioid and the period-2 disc, in closed form.
+        let (xq, y2) = (c.0 - 0.25, c.1 * c.1);
+        let q = xq * xq + y2;
+        if q * (q + xq) < 0.25 * y2 {
+            // λ = 1 − √(1 − 4c): the principal square root of (1 − 4c), by halves; |λ′| = 2/|√(1 − 4c)|.
+            let (ax, ay) = (1. - 4. * c.0, -4. * c.1);
+            let m = (ax * ax + ay * ay).sqrt();
+            let (sx, sy) = (((m + ax) * 0.5).sqrt(), ((m - ax) * 0.5).sqrt());
+            let sy = if ay < 0. { -sy } else { sy };
+            let r_pic = m.sqrt() / (2. * scale);
+            return (ball(disc((1. - sx, -sy)), r_pic), 1., true);
+        }
+        if (c.0 + 1.) * (c.0 + 1.) + y2 < 1. / 16. {
+            return (ball(disc((4. * (c.0 + 1.), 4. * c.1)), 1. / (4. * scale)), 1., true);
+        }
+        match probe(c) {
+            Pt::Out(d) => (aura, glow(d), false),
+            Pt::In(lam) => match probe((c.0 + scale * 0.5, c.1)) {
+                // λ half a pixel along: |dλ/dpixel| = 2·|λ₂ − λ|.
+                Pt::In(l2) => {
+                    let (ex, ey) = (l2.0 - lam.0, l2.1 - lam.1);
+                    (ball(disc(lam), 1. / (2. * (ex * ex + ey * ey).sqrt())), 1., true)
+                }
+                _ => (aura, 1., true),
+            },
+            Pt::Slow => (aura, 1., true),
         }
     };
     let (x0, x1) = ((cx - r - 1.) as usize, (cx + r + 2.) as usize);
@@ -1599,19 +1586,29 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
     let kf = k as f32;
     for py in y0..y1 {
         for px in x0..x1 {
+            let i = py * w + px;
+            if !full && inside[i >> 6] >> (i & 63) & 1 == 0 {
+                continue;
+            }
             let mut sum = [0f32; 3];
             let mut cover = 0f32;
+            let mut any = false;
             for m in 0..k * k {
                 let (jx, jy) = jitter(px as u32, py as u32, m);
                 let (sx, sy) = (((m % k) as f32 + jx) / kf, ((m / k) as f32 + jy) / kf);
-                let (s, a) = sample(px as f32 + sx - cx, py as f32 + sy - cy);
+                let (s, a, is_in) = sample(px as f32 + sx - cx, py as f32 + sy - cy);
                 for i in 0..3 {
                     sum[i] += s[i] * s[i] * a;
                 }
                 cover += a;
+                any |= is_in;
+            }
+            if full {
+                let bit = 1u64 << (i & 63);
+                inside[i >> 6] = if any { inside[i >> 6] | bit } else { inside[i >> 6] & !bit };
             }
             let rgb = if cover > 0. { sum.map(|c| (c / cover).sqrt()) } else { [0.; 3] };
-            buf[py * w + px] = pack(rgb, cover / (k * k) as f32);
+            buf[i] = pack(rgb, cover / (k * k) as f32);
         }
     }
 }
