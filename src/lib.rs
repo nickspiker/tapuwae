@@ -69,6 +69,8 @@ pub struct Params {
     mode: u8,
     /// The orbit trap's point, for mode 2.
     trap: (f64, f64),
+    /// The key's nudged features (see `Keyed`).
+    keyed: Keyed,
     /// The root whorl's radius in the plane: the plain window's half-span, and the disc's scale.
     radius: f64,
 }
@@ -83,12 +85,13 @@ struct View {
     theme: Theme,
     mode: u8,
     trap: (f32, f32),
+    keyed: Keyed,
 }
 
 impl Params {
     fn view(&self) -> View {
         let f = |v: (f64, f64)| (v.0 as f32, v.1 as f32);
-        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), theme: self.theme, mode: self.mode, trap: f(self.trap) }
+        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), theme: self.theme, mode: self.mode, trap: f(self.trap), keyed: self.keyed }
     }
 }
 
@@ -450,18 +453,51 @@ pub fn descend(x: f64) -> ((f64, f64), bool, Vec<(f64, f64)>) {
 /// A retry (`n`) redraws only the newest character's nudge (or the start, with no text), so it never undoes the characters before it.
 /// The walk folds back at the ends (a triangle wave), so it stays continuous and never jumps from one end to the other; `wraps` instead wraps it round, for a value that is an angle.
 fn walk(salt: &[u8; 32], domain: u8, text: &str, n: u32, wraps: bool) -> f64 {
+    walk_at(salt, domain, text, n, wraps, 0.5)
+}
+
+/// As `walk`, with the i-th character's nudge up to ±½·rate^i instead of ±2^−(i+1): a slower rate keeps a feature moving for more characters, a faster one settles it within the first few.
+fn walk_at(salt: &[u8; 32], domain: u8, text: &str, n: u32, wraps: bool, rate: f64) -> f64 {
     let ends: Vec<usize> = text.char_indices().map(|(i, ch)| i + ch.len_utf8()).collect();
     let mut v = unit(&draw(salt, domain, if ends.is_empty() { n } else { 0 }, &[])[0..4]);
     for (i, &end) in ends.iter().enumerate() {
         let last = i + 1 == ends.len();
         let h = unit(&draw(salt, domain, if last { n } else { 0 }, &text.as_bytes()[..end])[0..4]);
-        v += (h - 0.5) * (-((i + 1) as f64)).exp2();
+        v += (h - 0.5) * rate.powi(i as i32 + 1);
     }
     if wraps {
         v.rem_euclid(1.)
     } else {
         let r = v.rem_euclid(2.);
         if r > 1. { 2. - r } else { r }
+    }
+}
+
+/// The features a key nudges beside the placement, each walking from the device's own with its own falloff (`walk_at`'s rate), so some settle within a few characters and others keep shifting for longer.
+#[derive(Clone, Copy)]
+struct Keyed {
+    /// The ripple's four phases (turns): the field's contour waves slide as you type. Rate ¾: they keep moving the longest.
+    phase: [f32; 4],
+    /// A complex offset of the colouring coordinate, added to the look's. Rate 1/√2.
+    offset: (f32, f32),
+    /// A turn of the lamps across the screen, up to ±1/16 of a turn from the device's own. Rate ¼: it settles within the first few characters.
+    light_turn: f32,
+    /// A scale of the relief, 2^−½ to 2^½. Rate ¼.
+    relief: f32,
+}
+
+impl Keyed {
+    fn new(salt: &[u8; 32], text: &str, progressive: bool) -> Self {
+        let pick = |domain: u8, wraps: bool, rate: f64| (if progressive { walk_at(salt, domain, text, 0, wraps, rate) } else { unit(&draw(salt, domain, 0, text.as_bytes())[0..4]) }) as f32;
+        let slow = 0.75;
+        let mid = std::f64::consts::FRAC_1_SQRT_2;
+        let fast = 0.25;
+        Keyed {
+            phase: [pick(32, true, slow), pick(33, true, slow), pick(34, true, slow), pick(35, true, slow)],
+            offset: (pick(36, true, mid), pick(37, true, mid)),
+            light_turn: (pick(38, false, fast) - 0.5) * 0.125,
+            relief: (pick(39, false, fast) - 0.5).exp2(),
+        }
     }
 }
 
@@ -480,7 +516,8 @@ impl Params {
         let theme = Theme::from_bytes(&f);
         let mode = f[12] & 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
-        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), theme, mode, trap, radius: 1. };
+        let keyed = Keyed::new(salt, text, progressive);
+        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), theme, mode, trap, keyed, radius: 1. };
 
         // Each try draws a fresh c and framing from (salt, text, counter); the first framing that shows enough of the set is taken, and after 2⁵ tries the last one stands.
         let mut n = 0;
@@ -568,6 +605,9 @@ struct Theme {
     rim_s: f32,
     /// The device's lighting (see `Lighting`).
     lighting: Lighting,
+    /// The field's ripple: four waves across log₂ of the distance to the set, `ripple_f` turns per doubling and `ripple_a` amplitude; waves 0 and 1 move the lightness, 2 and 3 the OKLab a and b (green–red and blue–yellow), so the contours shift colour as well as tone.
+    ripple_f: [f32; 4],
+    ripple_a: [f32; 4],
 }
 
 /// One lamp: where it shines from (x right, y down across the screen, z up out of the picture, a unit vector), how strongly it moves the lightness, and the tint it gives the faces it lights (an OKLab (a, b) direction, unit length, scaled at use).
@@ -659,6 +699,22 @@ impl Theme {
         let rim_l = if f[29] & 2 == 2 { lo - 0.0625 } else { hi + 0.0625 };
         // The set's hue turn: none, ±⅙, ±¼, ±⅓ or ½ of a turn.
         let accent = [0., 1. / 6., -1. / 6., 0.25, -0.25, 1. / 3., -1. / 3., 0.5][(f[30] & 7) as usize] * tau;
+        // The ripple, from a third hash: each wave's frequency one of four bands (½, 1, 2, 4 turns per doubling of distance, jittered) and its amplitude banded too; a fifth of the waves are silent, so some devices have a plain field and others a rich one.
+        let rh = *blake3::Hasher::new().update(f).update(b"ripple").finalize().as_bytes();
+        let rj = *blake3::Hasher::new().update(f).update(b"ripple jitter").finalize().as_bytes();
+        let ru = |i: usize, n: u32| band(unit(&rh[i..i + 4]) as f32, unit(&rj[i..i + 4]) as f32, n);
+        let ripple = {
+            let mut fq = [0f32; 4];
+            let mut am = [0f32; 4];
+            for k in 0..4 {
+                fq[k] = (ru(k * 4, 4) * 4. - 1.).exp2();
+                let silent = rh[k + 28] % 5 == 0;
+                // Lightness waves up to 2⁻⁵ each; colour waves up to 2⁻⁶ of chroma per unit lightness (the gamut cap in `soft` still holds them).
+                let top = if k < 2 { 1. / (1 << 5) as f32 } else { 1. / (1 << 6) as f32 };
+                am[k] = if silent { 0. } else { top * (0.25 + 0.75 * ru(k * 4 + 2, 3)) };
+            }
+            (fq, am)
+        };
         Theme {
             // Twelve hue families.
             hue: u(0, 12) * tau,
@@ -672,6 +728,8 @@ impl Theme {
             body_s: 0.03 + u(20, 4) * 0.09375,
             rim_s: 0.015 + u(24, 4) * 0.09375,
             lighting: Lighting::from_bytes(blake3::hash(f).as_bytes()),
+            ripple_f: ripple.0,
+            ripple_a: ripple.1,
         }
     }
 }
@@ -766,16 +824,24 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> ([f32; 3], f32) {
         // The flame itself: its real part along the colouring, its imaginary part breathing.
         _ => (flame.0, flame.1),
     };
-    let (re, im) = (re + look.offset.0, im + look.offset.1);
+    let (re, im) = (re + look.offset.0 + v.keyed.offset.0, im + look.offset.1 + v.keyed.offset.1);
     let swing = (tau * re).sin();
     // Distance to the set: the real distance estimate, |z|·ln|z| / |dz/dz₀|, in plane units and in pixels (0 on it).
     let dist = if escaped { r * r.ln() / o.dm * (-(o.dm_exp as f32)).exp2() } else { 0. };
     let dist_px = dist / k;
-    // Distance contours: a soft ripple at every factor 2^(2/3) of distance from the set (log₂ distance × 1.5 per turn), the field's own topography.
-    // Near the set the contours crowd closer than a pixel (1.5/(d·ln 2) of them per pixel at d pixels out) and would alias into hatching, so they fade in as d²/(d² + (6/ln 2)²): gone within a few pixels of the set, full once they are over 4 pixels apart.
-    let crowd = 6. / std::f32::consts::LN_2;
-    let contour = (tau * 1.5 * dist.log2()).sin() * (1. / (1 << 7) as f32) * dist_px * dist_px / (dist_px * dist_px + crowd * crowd);
-    let breathe = (tau * im).cos() * (1. / (1 << 6) as f32) + if escaped { contour } else { 0. };
+    // Distance contours: the theme's ripple, four waves across log₂ of the distance from the set, the field's own topography, their phases nudged by the key.
+    // Near the set a wave of f turns per doubling has f/(d·ln 2) contours per pixel at d pixels out and would alias into hatching, so it fades in as d²/(d² + (4f/ln 2)²): gone within a few pixels of the set, full once its contours are over 4 pixels apart.
+    let crowd = 4. / std::f32::consts::LN_2;
+    // The faster a wave, the more closely its contours crowd near the set, so each fades in by its own frequency: d²/(d² + (crowd·f)²).
+    let ld = dist.log2();
+    let th0 = &v.theme;
+    let wave = |k: usize| {
+        let f = th0.ripple_f[k];
+        let fade = dist_px * dist_px / (dist_px * dist_px + (crowd * f) * (crowd * f));
+        th0.ripple_a[k] * (tau * (f * ld + v.keyed.phase[k])).sin() * fade
+    };
+    let (rl, ra, rb) = if escaped { (wave(0) + wave(1), wave(2), wave(3)) } else { (0., 0., 0.) };
+    let breathe = (tau * im).cos() * (1. / (1 << 6) as f32) + rl;
     // Body: within about a pixel of the set, falling smoothly (C∞) to nothing a few pixels out.
     let body = 1. / (1. + dist_px * dist_px);
     // Rim: strongest about 2¹ pixels out, a smooth bump in log distance.
@@ -787,12 +853,15 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> ([f32; 3], f32) {
     let fixed = Lighting::fixed();
     let lt = if look.fixed_light { &fixed } else { &th.lighting };
     // The surface's tilt from the slope (the parameter plane has no u, so it lights flat).
-    let sr = lt.relief * look.relief;
+    let sr = lt.relief * look.relief * v.keyed.relief;
+    // The key's turn of the lamps, applied with the view's own.
+    let turn = (TAU as f32 * v.keyed.light_turn).sin_cos();
+    let lrot = (v.rot.0 * turn.1 - v.rot.1 * turn.0, v.rot.0 * turn.0 + v.rot.1 * turn.1);
     let hyp = (sr * sr + dist_px * dist_px).sqrt();
     let (sin_a, cos_a) = (sr / hyp, dist_px / hyp);
     let julia = v.kind == Kind::Julia;
     let lit = |lamp: &Lamp| {
-        let d = in_plane(lamp.dir, v.rot);
+        let d = in_plane(lamp.dir, lrot);
         let n_dot_l = if julia { sin_a * (o.ux * d.0 + o.uy * d.1) + cos_a * d.2 } else { d.2 };
         lamp.strength * (n_dot_l - d.2)
     };
@@ -803,11 +872,11 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> ([f32; 3], f32) {
     let (kw, fw, sw) = (soft_w(positive_part(key)), soft_w(positive_part(fill)), soft_w(positive_part(-shading)));
     let (k_t, f_t, s_t) = (0.02, 0.01, 0.01);
     let tint = (
-        lt.key.tint.0 * kw * k_t + lt.fill.tint.0 * fw * f_t + lt.shadow.0 * sw * s_t,
-        lt.key.tint.1 * kw * k_t + lt.fill.tint.1 * fw * f_t + lt.shadow.1 * sw * s_t,
+        lt.key.tint.0 * kw * k_t + lt.fill.tint.0 * fw * f_t + lt.shadow.0 * sw * s_t + ra,
+        lt.key.tint.1 * kw * k_t + lt.fill.tint.1 * fw * f_t + lt.shadow.1 * sw * s_t + rb,
     );
     // Nacre: the hue turns with the surface's facing across the key lamp (the normal's horizontal part crossed with it), up to ¼ rad either way, the way mother-of-pearl shifts colour with angle; only where the surface tilts.
-    let kd = in_plane(lt.key.dir, v.rot);
+    let kd = in_plane(lt.key.dir, lrot);
     let kh = (kd.0 * kd.0 + kd.1 * kd.1).sqrt();
     let nacre = if julia { 0.25 * sin_a * (o.ux * kd.1 - o.uy * kd.0) / kh } else { 0. };
     let edge = rim * (1. - body);
