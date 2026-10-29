@@ -30,8 +30,9 @@ use std::f64::consts::TAU;
 const MAX_ITER: u32 = 1 << 10;
 /// The placement's escape (f64): |z|² past √(f64::MAX), as the render's is past √(f32::MAX), so the descent's distance estimates use every clean bit.
 const BAIL_SQ: f64 = 1.340_780_792_994_259_7e154;
-/// The render's escape: |z|² past √(f32::MAX), the last point at which the next square is still finite (mandelbrot-exploder's rule), so the smooth count, the distance estimate and the flames get every clean bit of the escape.
-const BAIL_SQ_F32: f32 = 1.844_674_4e19;
+/// The render's escape: |z|² past 2⁶², so the next square stays finite with room to spare (at most 2¹²⁴, against f32's 2¹²⁸), and the smooth count, the distance estimate and the flames get nearly every clean bit of the escape.
+/// WHY not √(f32::MAX) (mandelbrot-exploder's rule, used here until 2026-10-29): an orbit just under it squares to just under f32::MAX, and the + c and the rounding of x² + y² carried |z|² to ∞, which made the smooth count −∞ and the flame NaN; about one sample in 2²⁶ (measured), each poisoning its pixel.
+const BAIL_SQ_F32: f32 = (1u64 << 62) as f32;
 /// A jump of 2² iterations between neighbouring thumbnail pixels marks an edge of the set.
 const JUMP: i32 = 1 << 2;
 /// A framing is kept when at least a quarter of the thumbnail is edge.
@@ -560,6 +561,17 @@ impl Attest {
     }
 }
 
+/// How a pixel is sampled (the button; the plain disc keeps `Linear`).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Aa {
+    /// One sample at a time: two always, then another while the newest moved more than m − 1 levels from the mean of the m before it, up to `MAX_SAMPLES`.
+    Linear,
+    /// Passes that double the count (1, 1, 2, 4, … samples, so totals 1, 2, 4, 8, …): after each, the new pass's mean against the mean of all before it, in 8-bit display levels; stop once they agree within `threshold`, or at 2^`max_log2` samples; never before 2^`min_log2` (a pixel's first two samples agreeing by luck on either side of a thin arc stopped it early, the scheme's worst errors). A pass's mean is far steadier than one sample, so the test can be tight and still stop early where the pixel is plain.
+    Doubling { threshold: f32, min_log2: u32, max_log2: u32 },
+    /// Exactly n samples (a ground truth to measure the others against).
+    Fixed(u32),
+}
+
 /// Whether a look shows an attest feature: never (Photon's avatars), as the device drew it, or one kind forced (for comparing kinds side by side).
 #[derive(Clone, Copy, PartialEq)]
 pub enum Pick {
@@ -913,12 +925,14 @@ pub struct Look {
     pub button: bool,
     /// The flame as electricity (attest): arcs along the flame's contours, white-hot at their cores, haloed in the device's colour, added as light; 0 off (the avatars), 1 as designed, more or less to taste.
     pub electric: f32,
+    /// How the button samples each pixel (see `Aa`); the plain disc always samples linearly.
+    pub aa: Aa,
 }
 
 impl Default for Look {
     /// Photon's avatar: no offset, the device's own relief and lighting, √(1 − |p|²), no attest features.
     fn default() -> Self {
-        Look { offset: (0., 0.), relief: 1., fixed_light: false, vignette: 2, material: Pick::Off, engrave: Pick::Off, mirror: Pick::Off, style: Pick::Off, button: false, electric: 0. }
+        Look { offset: (0., 0.), relief: 1., fixed_light: false, vignette: 2, material: Pick::Off, engrave: Pick::Off, mirror: Pick::Off, style: Pick::Off, button: false, electric: 0., aa: Aa::Linear }
     }
 }
 
@@ -1303,14 +1317,20 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
         if s2 >= 1. {
             return ([0.; 3], 0.);
         }
-        if s2 >= b2 {
-            // u: 0 at q_end/2⁴ (full light holds inside it), 1 at q_end; the light 1 − u between, softly 1 before and 0 after.
+        // Where the sample falls against the ball, as one ratio (|p|² in the ball's units), so the glow and the ball split on the same number.
+        // WHY: the edge itself must belong to neither side's singularity. Tested apart (s2 ≥ b2 for the glow, then (sx/BALL)² + (sy/BALL)² for the ball), a sample exactly on the edge took log₂(0) = −∞ in the glow (its soft clamp then gave ∞ − ∞) and one a rounding inside it took 1/√(1 − q2) with q2 rounded to 1; either NaN poisoned its pixel's whole sum (measured: about one pixel in 2¹⁰ on the rim at 2¹⁰ samples, 2026-10-29).
+        let q2 = s2 / b2;
+        if q2 > 1. {
+            // q2 > 1 means s2 > b2 exactly, so the log is finite. u: 0 at q_end/2⁴ (full light holds inside it), 1 at q_end; the light 1 − u between, softly 1 before and 0 after.
             let u = 1. + (s2 - b2).log2() / octaves - q_end.log2() / octaves;
             let light = (positive_part(1. - u) - positive_part(-u)) * (1. - s2.powi(1 << 3));
             return (aura, light);
         }
+        // On the rim itself the warp is infinite and the taper is 0: only the device's colour shows.
+        if q2 == 1. {
+            return (aura, 1.);
+        }
         let (qx, qy) = (sx / BALL, sy / BALL);
-        let q2 = qx * qx + qy * qy;
         let g = rad / (1. - q2).sqrt();
         let (a, b) = (qx * g, qy * g);
         let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
@@ -1320,10 +1340,18 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
         ([0, 1, 2].map(|i| aura[i] + (c[i] - aura[i]) * taper), 1.)
     };
     let e_out = r * BALL;
+    // The fewest samples a pixel takes before it may stop (doubling passes).
+    let floor = if let Aa::Doubling { min_log2, .. } = look.aa { 1usize << min_log2 } else { 0 };
+    // The most samples a pixel can take under this look.
+    let cap = match look.aa {
+        Aa::Linear => MAX_SAMPLES,
+        Aa::Doubling { max_log2, .. } => 1 << max_log2,
+        Aa::Fixed(n) => n as usize,
+    };
     buf.par_chunks_mut(w)
         .enumerate()
         .map(|(py, row)| {
-            let mut hist = vec![0u64; MAX_SAMPLES + 1];
+            let mut hist = vec![0u64; cap + 1];
             for px in 0..w {
                 let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
                 let d = (dx * dx + dy * dy).sqrt();
@@ -1333,29 +1361,51 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
                 }
                 // Across the ball's edge: at least 2³ samples.
                 let least = if (d - e_out).abs() < 1. { 1 << 3 } else { 2 };
-                // Linear-light sums, premultiplied by coverage, and the coverage's sum.
+                // Linear-light sums, premultiplied by coverage, and the coverage's sum; for doubling passes, the same sums as they stood before the current pass, and where it ends.
                 let mut sum = [0f32; 3];
                 let mut cover = 0f32;
                 let mut m = 0usize;
+                let (mut before, mut before_cover, mut pass_end) = ([0f32; 3], 0f32, 1usize);
                 loop {
                     let (jx, jy) = jitter(px as u32, py as u32, m as u32);
                     let (s, a) = sample(px as f32 + jx - cx, py as f32 + jy - cy);
-                    // The newest sample against the mean of the ones before it, premultiplied, in 8-bit display levels (coverage counted as a fourth channel).
-                    let spread = if m == 0 {
-                        f32::MAX
-                    } else {
+                    // Linear: the newest sample against the mean of the ones before it, premultiplied, in 8-bit display levels (coverage counted as a fourth channel).
+                    let spread = if look.aa == Aa::Linear && m > 0 {
                         let ma = cover / m as f32;
                         let mean = sum.map(|c| (c / m as f32).sqrt());
                         let now = s.map(|c| c * a.sqrt());
                         (0..3).map(|i| (now[i] - mean[i]).abs() * 255.).fold((a - ma).abs() * 255., f32::max)
+                    } else {
+                        f32::MAX
                     };
                     for i in 0..3 {
                         sum[i] += s[i] * s[i] * a;
                     }
                     cover += a;
                     m += 1;
-                    let threshold = m as f32;
-                    if m >= MAX_SAMPLES || (m >= least && spread <= threshold) {
+                    let done = match look.aa {
+                        Aa::Linear => m >= cap || (m >= least && spread <= m as f32),
+                        Aa::Fixed(_) => m >= cap,
+                        Aa::Doubling { threshold, .. } => {
+                            if m < pass_end {
+                                false
+                            } else {
+                                // A pass has just ended: its mean against the mean of all before it (the first sample alone has nothing to compare).
+                                let old = pass_end / 2;
+                                let agree = old > 0 && {
+                                    let (n_new, n_old) = ((m - old) as f32, old as f32);
+                                    let level = |s: f32, n: f32| (s / n).sqrt() * 255.;
+                                    let alpha = ((cover - before_cover) / n_new - before_cover / n_old).abs() * 255.;
+                                    (0..3).map(|i| (level(sum[i] - before[i], n_new) - level(before[i], n_old)).abs()).fold(alpha, f32::max) <= threshold
+                                };
+                                before = sum;
+                                before_cover = cover;
+                                pass_end *= 2;
+                                m >= cap || (m >= least.max(floor) && agree)
+                            }
+                        }
+                    };
+                    if done {
                         break;
                     }
                 }
@@ -1365,7 +1415,7 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
             }
             hist
         })
-        .reduce(|| vec![0u64; MAX_SAMPLES + 1], |a, b| a.iter().zip(&b).map(|(x, y)| x + y).collect())
+        .reduce(|| vec![0u64; cap + 1], |a, b| a.iter().zip(&b).map(|(x, y)| x + y).collect())
 }
 
 /// The view as the look shows it: mirrored (attest) is the conjugate picture, J(c̄) about the eye's conjugate turned the other way, which is the plain one flipped top to bottom with its whorl turning the other way; the lamps stay where they are.
@@ -1472,7 +1522,7 @@ mod tests {
         }
     }
 
-    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the soft flame joined every colouring method (2026-10-29, owner-approved) (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
+    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the soft flame joined every colouring method and the escape moved to 2⁶² (2026-10-29) (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
     #[test]
     fn avatars_hold_still() {
         let mut h = blake3::Hasher::new();
@@ -1486,7 +1536,7 @@ mod tests {
                 h.update(&p.to_le_bytes());
             }
         }
-        assert_eq!(h.finalize().to_hex().as_str(), "a2c80c8a7273f537a56b41d8bd4a235ee18bca5e8d454e6297650ffcf883b737");
+        assert_eq!(h.finalize().to_hex().as_str(), "897e69498fc4ad607fef075cdc7adf3d5f46fb661c1bdf588a0f978e0567602a");
     }
 
     /// A spiral's eye really is periodic: f^p carries it back onto itself.
