@@ -44,6 +44,8 @@ const PERIODS: u32 = 1 << 4;
 const SPIRAL_TRIES: u32 = 1 << 5;
 /// The smallest window half-span kept, so the f32 render still has many representable steps per pixel.
 const MIN_HALF: f64 = 1. / (1 << 8) as f64;
+/// The engraving's radius, squared: level lines and rays are read where the orbit first passes |z| = 2⁸, close enough to the set that the rays' angle has not yet turned too fast to draw.
+const ENGRAVE_SQ: f32 = (1u32 << 16) as f32;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -71,6 +73,8 @@ pub struct Params {
     trap: (f64, f64),
     /// The key's nudged features (see `Keyed`).
     keyed: Keyed,
+    /// The device's attest-only choices (see `Attest`), drawn under their own domain so they never move an avatar.
+    attest: Attest,
     /// The root whorl's radius in the plane: the plain window's half-span, and the disc's scale.
     radius: f64,
 }
@@ -86,12 +90,13 @@ struct View {
     mode: u8,
     trap: (f32, f32),
     keyed: Keyed,
+    attest: Attest,
 }
 
 impl Params {
     fn view(&self) -> View {
         let f = |v: (f64, f64)| (v.0 as f32, v.1 as f32);
-        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), theme: self.theme, mode: self.mode, trap: f(self.trap), keyed: self.keyed }
+        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), theme: self.theme, mode: self.mode, trap: f(self.trap), keyed: self.keyed, attest: self.attest }
     }
 }
 
@@ -124,6 +129,10 @@ struct Orbit {
     /// The direction of z / (dz/dz₀) at escape, a unit complex number: the outward normal of the potential's level line, the "slope" the set's relief would have there (Julia sets only; (0, 0) in the parameter plane).
     ux: f32,
     uy: f32,
+    /// The orbit where it first passed |z| = 2⁸ (`ENGRAVE_SQ`): its level `lv` (that crossing's smooth count, m + 1 − log₂(ln|z_m|² / ln 2¹⁶), an integer exactly on the crossing), its angle `ray` in turns, and ln of how fast that angle turns per plane unit, ln(|dz_m/dz₀| / |z_m|). All 0 if it never got there.
+    lv: f32,
+    ray: f32,
+    ln_turn: f32,
 }
 
 /// Iterate z² + c from the plane point (px, py): z₀ = that point in a Julia set, c = that point in the parameter plane.
@@ -145,6 +154,7 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
     let lnln_bail = BAIL_SQ_F32.ln().ln();
     let ln_2ln2 = (2. * 2f32.ln()).ln();
     let mut dm_exp = 0i32;
+    let (mut lv, mut ray, mut ln_turn, mut engraved) = (0f32, 0f32, 0f32, false);
     let finish = |fq: (f32, f32), fq_w: f32, fc: (f32, f32), fc_w: f32| ((fq.0 / fq_w, fq.1 / fq_w), (fc.0 / fc_w, fc.1 / fc_w));
     for n in 0..MAX_ITER {
         let (x2, y2) = (z.0 * z.0, z.1 * z.1);
@@ -155,7 +165,13 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
             let (zx, zy) = (z.0 / rz, z.1 / rz);
             let (ux, uy) = if julia { (zx * dir.0 + zy * dir.1, zy * dir.0 - zx * dir.1) } else { (0., 0.) };
             let (fq, fc) = finish(fq, fq_w, fc, fc_w);
-            return Orbit { n, x: z.0, y: z.1, dm, dm_exp, trap_sq, fq, fc, ux, uy };
+            return Orbit { n, x: z.0, y: z.1, dm, dm_exp, trap_sq, fq, fc, ux, uy, lv, ray, ln_turn };
+        }
+        if !engraved && r2 > ENGRAVE_SQ {
+            engraved = true;
+            lv = n as f32 + 1. - (r2.ln() / ENGRAVE_SQ.ln()).log2();
+            ray = z.1.atan2(z.0) * (1. / TAU as f32);
+            ln_turn = dm.ln() + dm_exp as f32 * std::f32::consts::LN_2 - 0.5 * r2.ln();
         }
         let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
         trap_sq = trap_sq.min(tx * tx + ty * ty);
@@ -184,7 +200,7 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
         z = (x2 - y2 + c.0, 2. * z.0 * z.1 + c.1);
     }
     let (fq, fc) = finish(fq, fq_w, fc, fc_w);
-    Orbit { n: MAX_ITER, x: z.0, y: z.1, dm, dm_exp, trap_sq, fq, fc, ux: 0., uy: 0. }
+    Orbit { n: MAX_ITER, x: z.0, y: z.1, dm, dm_exp, trap_sq, fq, fc, ux: 0., uy: 0., lv, ray, ln_turn }
 }
 
 /// The plane point under pixel (px, py) of a `w × h` window, `k` plane units per pixel: centre + rot·(u + is).
@@ -501,6 +517,52 @@ impl Keyed {
     }
 }
 
+/// A device's attest-only features, all from the salt alone (never the text), so they hold still while the handle is typed and the device is recognisable from the first frame: banded into a few nameable kinds each.
+#[derive(Clone, Copy)]
+struct Attest {
+    /// The ball's material: 0 matte, 1 satin, 2 gloss, 3 glass.
+    material: u8,
+    /// The engraving: 0 none, 1 level lines, 2 rays, 3 both (a net).
+    engrave: u8,
+    /// Mirrored (the conjugate Julia set, J(c̄)): the whorl turns the other way.
+    mirror: bool,
+    /// Level lines per level of the potential: ¼, ½ or 1.
+    levels: f32,
+    /// Rays per turn at each level: 2², 2³ or 2⁴.
+    rays: f32,
+}
+
+impl Attest {
+    fn new(salt: &[u8; 32]) -> Self {
+        let a = draw(salt, 64, 0, &[]);
+        Attest {
+            material: a[0] & 3,
+            engrave: a[1] & 3,
+            mirror: a[2] & 1 == 1,
+            levels: ((a[3] % 3) as f32 - 2.).exp2(),
+            rays: ((2 + a[4] % 3) as f32).exp2(),
+        }
+    }
+}
+
+/// Whether a look shows an attest feature: never (Photon's avatars), as the device drew it, or one kind forced (for comparing kinds side by side).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Pick {
+    Off,
+    Device,
+    Force(u8),
+}
+
+impl Pick {
+    fn of(self, device: u8) -> u8 {
+        match self {
+            Pick::Off => 0,
+            Pick::Device => device,
+            Pick::Force(k) => k,
+        }
+    }
+}
+
 impl Params {
     /// The picture for this device salt and this textbox content.
     pub fn new(salt: &[u8; 32], text: &str) -> Self {
@@ -517,7 +579,8 @@ impl Params {
         let mode = f[12] & 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
         let keyed = Keyed::new(salt, text, progressive);
-        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), theme, mode, trap, keyed, radius: 1. };
+        let attest = Attest::new(salt);
+        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), theme, mode, trap, keyed, attest, radius: 1. };
 
         // Each try draws a fresh c and framing from (salt, text, counter); the first framing that shows enough of the set is taken, and after 2⁵ tries the last one stands.
         let mut n = 0;
@@ -782,14 +845,30 @@ pub struct Look {
     pub relief: f32,
     /// One fixed light for every device (`Lighting::fixed`) instead of each device's own.
     pub fixed_light: bool,
-    /// The rim vignette's radial power k: the disc is multiplied by √(1 − |p|^k) (2 for Photon's avatars; ferros's attest screen uses 4, √(1 − |p|⁴), which stays bright further out and falls to black in a tighter band at the rim).
+    /// The rim vignette's radial power k: the disc is multiplied by √(1 − |p|^k) (2 for Photon's avatars; ferros's attest screen uses 12, √(1 − |p|¹²), flat almost to the rim and black in a narrow band there).
     pub vignette: i32,
+    /// The attest features (see `Attest`): the ball's material, the engraving, and the mirror.
+    pub material: Pick,
+    pub engrave: Pick,
+    pub mirror: Pick,
 }
 
 impl Default for Look {
-    /// No offset, the device's own relief and lighting.
+    /// Photon's avatar: no offset, the device's own relief and lighting, √(1 − |p|²), no attest features.
     fn default() -> Self {
-        Look { offset: (0., 0.), relief: 1., fixed_light: false, vignette: 2 }
+        Look { offset: (0., 0.), relief: 1., fixed_light: false, vignette: 2, material: Pick::Off, engrave: Pick::Off, mirror: Pick::Off }
+    }
+}
+
+impl Look {
+    /// Photon's avatar (the default).
+    pub fn avatar() -> Self {
+        Look::default()
+    }
+
+    /// ferros's attest mark: √(1 − |p|¹²), and every attest feature as the device drew it.
+    pub fn attest() -> Self {
+        Look { vignette: 12, material: Pick::Device, engrave: Pick::Device, mirror: Pick::Device, ..Look::default() }
     }
 }
 
@@ -798,7 +877,7 @@ impl Default for Look {
 fn in_plane(d: (f32, f32, f32), rot: (f32, f32)) -> (f32, f32, f32) {
     (d.0 * rot.0 - d.1 * rot.1, d.0 * rot.1 + d.1 * rot.0, d.2)
 }
-
+/// One point of the plane as a visible colour in [0, 1]; `k` is plane units per pixel; `sphere` is the ball's unit normal under it (screen x right, y down, z out; (0, 0, 1) for a flat picture), and `hair` the engraving's line width in pixels.
 /// One point of the plane as a visible colour in [0, 1]; `k` is plane units per pixel; `lp` is the light's direction in the plane.
 /// One soft scheme, low contrast: the field is the theme's ground, the set's body its second tone, the edge a glow or an ink line; nothing goes near black or white, and nothing is saturated.
 /// The colouring coordinate is complex, u = (the colouring method's value) + i·(the orbit's escape angle in turns), plus the look's offset: Re u swings the hue either side of the theme's base (by the theme's spread) and Im u breathes the lightness a little, so both halves of the offset move every method.
@@ -806,7 +885,7 @@ fn in_plane(d: (f32, f32, f32), rot: (f32, f32)) -> (f32, f32, f32) {
 /// Its gradient points along u = z/(dz/dz₀) (the potential's own direction, outward) with magnitude s/d per pixel at d pixels from the set (d being the distance estimate, G/|∇G| up to a constant), so its unit normal is (sin α·u, cos α) with sin α = s/√(s² + d²), cos α = d/√(s² + d²), exact and finite even on the set (d = 0).
 /// Each lamp's Lambert n·l, taken relative to a flat surface (which sees l_z), moves the lightness by strength·(n·l − l_z): faces turned to it rise, faces turned away fall, the flat field far out is untouched, and nothing is clipped. The faces a lamp lights take its tint, and the faces left in shade take the shadow tint, each split off smoothly (`positive_part`).
 #[inline]
-fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> ([f32; 3], f32) {
+fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32), hair: f32) -> ([f32; 3], f32) {
     let o = orbit(x, y, v);
     let r = (o.x * o.x + o.y * o.y).sqrt();
     let escaped = o.n < MAX_ITER;
@@ -885,8 +964,52 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> ([f32; 3], f32) {
     // Lightness and saturation: the ground's, moving to the body's on the set and the edge's around it, settling back to the ground far out; the slope's shading on top, everywhere it tilts.
     let lightness = th.ground_l + (th.body_l - th.ground_l) * body + (th.rim_l - th.ground_l) * edge * (1. - far) + shading + breathe;
     let sat = th.ground_s + (th.body_s - th.ground_s) * body + (th.rim_s - th.ground_s) * edge * (1. - far);
+    // The engraving (attest): hairlines `hair` pixels wide, inked or glowing as the theme's edge is, on the level lines of the potential and on the rays, both read where the orbit first passed 2⁸ (see `Orbit`), so each level's rays meet the next level's twice as many exactly on a level line.
+    // A line's distance in pixels is its coordinate's distance to the nearest whole number over the coordinate's change per pixel, with |sin(πx)|/π standing in for that distance (C∞, and the same near a line); each family fades in as its lines get more than 2³ hairs apart, so they never crowd into hatching near the set.
+    let engrave = look.engrave.of(v.attest.engrave);
+    let line = if escaped && engrave != 0 {
+        let pi = std::f32::consts::PI;
+        let ink = |x: f32, per_px: f32| {
+            let spacing = 1. / per_px;
+            let d = (pi * x).sin() / (pi * per_px * hair);
+            let crowd = 8.;
+            (-(d * d)).exp2() * spacing * spacing / (spacing * spacing + crowd * crowd * hair * hair)
+        };
+        let levels = if engrave & 1 == 1 { let m = v.attest.levels; ink(o.lv * m, m / (std::f32::consts::LN_2 * dist_px)) } else { 0. };
+        let rays = if engrave & 2 == 2 { let n = v.attest.rays; ink(o.ray * n, n * o.ln_turn.exp() * k / tau) } else { 0. };
+        1. - (1. - levels) * (1. - rays)
+    } else {
+        0.
+    };
+    // A line moves the lightness 2⁻³ the way the theme's edge goes from its ground (ink darker, glow lighter) and takes the edge's saturation.
+    let way = if th.rim_l > th.ground_l { 1. } else { -1. };
+    let lightness = lightness + way * 0.125 * line;
+    let sat = sat + (th.rim_s - sat) * line;
     // Hue: the ground's base, drifting toward the far field, swung by the colouring, turned by the nacre, and turned by the theme's accent on the set.
-    (soft(th, lightness, sat, th.spread * swing + th.drift * far + nacre + th.accent * body, tint), dist_px)
+    let rgb = soft(th, lightness, sat, th.spread * swing + th.drift * far + nacre + th.accent * body, tint);
+    // The material (attest): a highlight of the key lamp on the ball, its normal the sphere's (`sphere`, screen x right, y down, z out) tilted by the relief's slope, and for glass a Fresnel sheen toward the rim. Added as a screen blend, c + s·(1 − c), so it brightens without clipping.
+    let material = look.material.of(v.attest.material);
+    let rgb = if material == 0 {
+        rgb
+    } else {
+        // The relief's horizontal tilt, from the plane back to the screen (the conjugate of the view's turn).
+        let (px, py) = if julia { (sin_a * o.ux, sin_a * o.uy) } else { (0., 0.) };
+        let (rx, ry) = (px * v.rot.0 + py * v.rot.1, -px * v.rot.1 + py * v.rot.0);
+        let n = (sphere.0 + rx * 0.25, sphere.1 + ry * 0.25, sphere.2);
+        let nl = (n.0 * n.0 + n.1 * n.1 + n.2 * n.2).sqrt();
+        let n = (n.0 / nl, n.1 / nl, n.2 / nl);
+        let l = { let d = lt.key.dir; (d.0 * turn.1 - d.1 * turn.0, d.0 * turn.0 + d.1 * turn.1, d.2) };
+        let h = (l.0, l.1, l.2 + 1.);
+        let hl = (h.0 * h.0 + h.1 * h.1 + h.2 * h.2).sqrt();
+        let nh = positive_part((n.0 * h.0 + n.1 * h.1 + n.2 * h.2) / hl);
+        let spec = match material {
+            1 => 0.25 * nh.powi(1 << 3),
+            2 => 0.125 * nh.powi(1 << 3) + 0.75 * nh.powi(1 << 6),
+            _ => 0.875 * nh.powi(1 << 8) + 0.375 * (1. - n.2).powi(1 << 2),
+        };
+        rgb.map(|c| c + spec * (1. - c))
+    };
+    (rgb, dist_px)
 }
 
 
@@ -905,7 +1028,7 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
         for px in 0..w {
             let (x, y) = plane(&v, px, py, w, h, k);
-            row[px] = pack(shade(x, y, &v, k, &Look::default()).0, 1.);
+            row[px] = pack(shade(x, y, &v, k, &Look::default(), (0., 0., 1.), 1.).0, 1.);
         }
     });
 }
@@ -937,7 +1060,15 @@ pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Para
 
 /// As `render_disc`, returning how many pixels took each number of samples (index = samples taken; pixels outside the disc are not counted).
 pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) -> Vec<u64> {
-    let v = p.view();
+    let mut v = p.view();
+    // Mirrored (attest): the conjugate picture, J(c̄) about the eye's conjugate turned the other way, which is this one flipped top to bottom with its whorl turning the other way; the lamps stay where they are.
+    if look.mirror.of(v.attest.mirror as u8) == 1 {
+        v.c.1 = -v.c.1;
+        v.centre.1 = -v.centre.1;
+        v.rot.1 = -v.rot.1;
+    }
+    // The engraving's hairline: 2⁻⁷ of the disc's radius.
+    let hair = r * (1. / (1 << 7) as f32);
     let rad = p.radius as f32;
     let (r_in, r_out) = ((r - 0.5).max(0.), r + 0.5);
     let (r_in2, r_out2) = (r_in * r_in, r_out * r_out);
@@ -956,7 +1087,7 @@ pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, 
         let k = rad / (r * (1. - q2));
         // |p|^k as (|p|²)^(k/2): k is even in every use, so it stays a whole power.
         let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
-        shade(x, y, &v, k, look).0.map(|c| c * taper)
+        shade(x, y, &v, k, look, (qx, qy, (1. - q2).sqrt()), hair).0.map(|c| c * taper)
     };
     buf.par_chunks_mut(w)
         .enumerate()
@@ -1093,6 +1224,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew when the attest features arrived (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
+    #[test]
+    fn avatars_hold_still() {
+        let mut h = blake3::Hasher::new();
+        for device in 0u32..(1 << 3) {
+            let salt = *blake3::hash(&device.to_le_bytes()).as_bytes();
+            let d = 1usize << 6;
+            let mut px = vec![0u32; d * d];
+            let r = d as f32 * 0.5;
+            render_disc(&mut px, d, r, r, r, &Params::new(&salt, ""), &Look::avatar());
+            for p in &px {
+                h.update(&p.to_le_bytes());
+            }
+        }
+        assert_eq!(h.finalize().to_hex().as_str(), "e8ec4f4cab5a2dc99d69f0a963b149876f3da2b3a9d02fc1faafbc163c976de0");
     }
 
     /// A spiral's eye really is periodic: f^p carries it back onto itself.
