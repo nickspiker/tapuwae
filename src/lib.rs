@@ -446,20 +446,37 @@ pub fn descend(x: f64) -> ((f64, f64), bool, Vec<(f64, f64)>) {
     ((x, y), true, trail)
 }
 
+/// A progressive walk in [0, 1): the device's own starting value (the hash of the empty text), then for the i-th character (from 1) a nudge of up to ±2^−(i+1), from the hash of the text up to and including it, so the first characters move the picture a lot and each later one half as much as the one before; by the 25th a nudge is under 2⁻²⁵.
+/// A retry (`n`) redraws only the newest character's nudge (or the start, with no text), so it never undoes the characters before it.
+/// The walk folds back at the ends (a triangle wave), so it stays continuous and never jumps from one end to the other; `wraps` instead wraps it round, for a value that is an angle.
+fn walk(salt: &[u8; 32], domain: u8, text: &str, n: u32, wraps: bool) -> f64 {
+    let ends: Vec<usize> = text.char_indices().map(|(i, ch)| i + ch.len_utf8()).collect();
+    let mut v = unit(&draw(salt, domain, if ends.is_empty() { n } else { 0 }, &[])[0..4]);
+    for (i, &end) in ends.iter().enumerate() {
+        let last = i + 1 == ends.len();
+        let h = unit(&draw(salt, domain, if last { n } else { 0 }, &text.as_bytes()[..end])[0..4]);
+        v += (h - 0.5) * (-((i + 1) as f64)).exp2();
+    }
+    if wraps {
+        v.rem_euclid(1.)
+    } else {
+        let r = v.rem_euclid(2.);
+        if r > 1. { 2. - r } else { r }
+    }
+}
+
 impl Params {
     /// The picture for this device salt and this textbox content.
     pub fn new(salt: &[u8; 32], text: &str) -> Self {
         Self::new_placed(salt, text, true)
     }
 
-    /// As `new`, choosing whether the descent's x is banded per device (`banded`: the device's own stretch of 1/12 of [−2, X_RIGHT], every key inside it) or free over the whole span; either way the draw is slanted toward the right (see the crate's doc).
-    pub fn new_placed(salt: &[u8; 32], text: &str, banded: bool) -> Self {
+    /// As `new`, choosing whether the key's continuous choices (the descent's x, c's height, the whorl's zoom and the turn) walk progressively from the device's own (`progressive`, see `walk`) or are drawn afresh for every key; either way x is slanted toward the right (see the crate's doc).
+    pub fn new_placed(salt: &[u8; 32], text: &str, progressive: bool) -> Self {
         let f = draw(salt, 1, 0, &[]);
-        // The device's stretch of the real axis: 1/12 of the span, placed so it fits.
         let span = X_RIGHT + 2.;
-        let width = span / 12.;
-        // √u: density rising linearly toward the right, so fewer devices land among the antenna's needles.
-        let x0 = -2. + unit(&draw(salt, 5, 0, &[])[0..4]).sqrt() * (span - width);
+        // A key's continuous choices: progressive (`walk`) or each key free.
+        let pick = |domain: u8, n: u32, wraps: bool| if progressive { walk(salt, domain, text, n, wraps) } else { unit(&draw(salt, domain, n, text.as_bytes())[0..4]) };
         let theme = Theme::from_bytes(&f);
         let mode = f[12] & 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
@@ -468,11 +485,13 @@ impl Params {
         // Each try draws a fresh c and framing from (salt, text, counter); the first framing that shows enough of the set is taken, and after 2⁵ tries the last one stands.
         let mut n = 0;
         loop {
-            let t = draw(salt, 3, n, text.as_bytes());
+            // The discrete choices (which sprayed cycles, which point of the winning cycle) are the device's own, so only c moves them.
+            let t = draw(salt, 3, n, if progressive { &[] } else { text.as_bytes() });
+            // √u: density rising linearly toward the right, so fewer keys land among the antenna's needles.
+            let x = -2. + pick(16, n, false).sqrt() * span;
             n += 1;
-            let x = if banded { x0 + unit(&t[16..20]) * width } else { -2. + unit(&t[16..20]).sqrt() * span };
             let (land, _, _) = descend(x);
-            let c = (land.0, land.1 + (-(4. + unit(&t[20..24]) * HEIGHT_STOPS as f64)).exp2());
+            let c = (land.0, land.1 + (-(4. + pick(17, n - 1, false) * HEIGHT_STOPS as f64)).exp2());
             let along = j_extent(c);
             // Every key sits on the ROOT whorl's eye, dead centre, never a preimage of it (a preimage is a smaller copy: a sub-spiral).
             // The root is the cycle closest to neutral (smallest ln|λ|): it turns slowest and grows slowest, so its whorl is the largest in the picture. Candidates: the cycle of the component beneath the landing (`root_cycle`, near-neutral when that component is close, and losing on its own when it is far), the α fixed point in closed form (the root near the main cardioid), and 2⁵ sprayed cycles of periods 1 to 2⁴.
@@ -491,7 +510,7 @@ impl Params {
                 };
                 let sprayed = (0..SPIRAL_TRIES).filter_map(|i| {
                     let period = 1 + (i & (PERIODS - 1));
-                    cycle_point(c, &draw(salt, 4, (n << 5) | i, text.as_bytes()), period).map(|(w, l, g)| (w, l, g, period))
+                    cycle_point(c, &draw(salt, 4, (n << 5) | i, if progressive { &[] } else { text.as_bytes() }), period).map(|(w, l, g)| (w, l, g, period))
                 });
                 root_cycle(c, land).into_iter().chain(alpha).chain(sprayed).fold(None, |best: Option<((f64, f64), f64, f64, u32)>, e| if best.map_or(true, |b| e.1 < b.1) { Some(e) } else { best })
             };
@@ -509,7 +528,7 @@ impl Params {
                     eye = (ee.0 + c.0, ee.1 + c.1);
                 }
                 // The whorl's radius R: 2⁻¹ to 2⁻³ of J's half-extent, or larger until the f32 render resolves it.
-                let mut stops = 1. + unit(&t[24..28]) * 2.;
+                let mut stops = 1. + pick(18, n - 1, false) * 2.;
                 let radius = loop {
                     let radius = along * (-stops).exp2();
                     if radius >= MIN_HALF || stops <= 1. {
@@ -517,7 +536,7 @@ impl Params {
                     }
                     stops -= 1.;
                 };
-                let turn = unit(&t[28..32]) * TAU;
+                let turn = pick(19, n - 1, true) * TAU;
                 let p = Params { c, centre: eye, half: radius, radius, rot: (turn.cos(), turn.sin()), ..base };
                 if framed(&p) || n >= 1 << 5 {
                     return p;
