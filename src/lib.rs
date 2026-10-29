@@ -1260,6 +1260,16 @@ fn pack(rgb: [f32; 3], alpha: f32) -> u32 {
     (a << 24) | (d(rgb[0]) << 16) | (d(rgb[1]) << 8) | d(rgb[2])
 }
 
+/// A visible colour (display gamma 2, as every colour here is) at opacity α as fluor's 16-bit `G2t16` pixel (`α << 48 | R << 32 | G << 16 | B`, each field 16 bits): each channel's `g2t` code is VSF's tanh(√light) of its light, and a display gamma 2 value already is √light, so the code is tanh(c)·2¹⁶ (×2¹⁶ truncation); its darkness is (2¹⁶ − 1 − code)·α, premultiplied as `pack`'s, and α is α·(2¹⁶ − 1).
+/// Unlike `pack`, which writes the gamma 2 value as the 8-bit code itself, this is the colour's own light in fluor's `g2t` buffer: diffuse white (c = 1) lands on code 49 911, and the arcs' cores above white (to 1 + ARC_HDR) keep their headroom instead of clipping.
+/// PROOF the code fits 16 bits: tanh(c) < 1, and every colour here is at most 1 + ARC_HDR = 2, where tanh(2)·2¹⁶ = 63 188; a negative c (none is made) would cast to 0, white's darkness at most.
+#[inline]
+pub fn pack_g2t16(rgb: [f32; 3], alpha: f32) -> u64 {
+    let one = ((1u32 << 16) - 1) as f32;
+    let d = |c: f32| ((one - (libm::tanhf(c) * (1u32 << 16) as f32) as u32 as f32) * alpha) as u64;
+    ((alpha * one) as u64) << 48 | d(rgb[0]) << 32 | d(rgb[1]) << 16 | d(rgb[2])
+}
+
 /// A visible colour (display gamma 2, as every colour here is) at coverage α as ferros's 16-bit surface pixel: light over black, each channel c·α in Q14 (white = 2¹⁴, the surface's own scale), red in the low 16 bits, then green and blue, and α (Q14) in the top 16. Rounded to the nearest step; the display dithers these to the panel, so a smooth glow keeps its 14 bits instead of the 8 a fluor pixel holds.
 #[inline]
 pub fn pack16(rgb: [f32; 3], alpha: f32) -> u64 {
@@ -1308,8 +1318,19 @@ pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Para
 
 /// As `render_disc`, returning how many pixels took each number of samples (index = samples taken; pixels outside the disc are not counted).
 pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) -> Vec<u64> {
+    disc_into(buf, w, cx, cy, r, p, look, pack)
+}
+
+/// As `render_disc`, into fluor's 16-bit `G2t16` pixels (`pack_g2t16`): the same samples, the same edge, each pixel's colour kept at 16 bits of `g2t` instead of 8 bits of gamma 2.
+pub fn render_disc_g2t16(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) {
+    disc_into(buf, w, cx, cy, r, p, look, pack_g2t16);
+}
+
+/// The disc renderers, written once over the pixel they write: `pack` turns a pixel's colour and coverage into it (0 is empty in both).
+#[allow(clippy::too_many_arguments)]
+fn disc_into<T: Copy + Send + From<u8>>(buf: &mut [T], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look, pack: fn([f32; 3], f32) -> T) -> Vec<u64> {
     if look.button {
-        return render_button(buf, w, cx, cy, r, p, look);
+        return render_button(buf, w, cx, cy, r, p, look, pack);
     }
     let v = mirrored(p.view(), look);
     // The engraving's hairline: 2⁻⁷ of the disc's radius.
@@ -1341,7 +1362,7 @@ pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, 
                 let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
                 let d2 = dx * dx + dy * dy;
                 if d2 >= r_out2 {
-                    row[px] = 0;
+                    row[px] = T::from(0);
                     continue;
                 }
                 let cover = if d2 <= r_in2 { 1. } else { (r_out2 - d2) / (r_out2 - r_in2) };
@@ -1387,7 +1408,8 @@ const BALL: f32 = GLOW_FRACTION / (GLOW_FRACTION + 1.);
 /// The mark as a round button (attest), in a disc of radius `r` pixels centred at (`cx`, `cy`): the picture as a ball, spherized as `render_disc` does, its rim tapering (by the look's vignette) into the device's own colour instead of to black, and that colour glowing on past the edge as ferros's circles glow (`draw::glow_log`): full at the edge, down by the same step every octave of q = s² − BALL² (the squared distance past it), gone 1/GLOW_FRACTION of the radius out, which is the disc's edge. The glow's ends are soft (`positive_part`), not clipped, and it is held to nothing at the disc's edge by 1 − s¹⁶. No rim, no glass: what shine there is comes from the set's own slope (see `shade`).
 /// The colour is the theme's hue at lightness 0.72, as saturated as the soft scheme allows.
 /// The ball is opaque and the glow is light over the background (coverage = its brightness), so samples are averaged with their coverage (premultiplied, in linear light); pixels across the ball's edge take at least 2³ samples, since a sharp circle can fall between two jittered samples on one side.
-fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) -> Vec<u64> {
+#[allow(clippy::too_many_arguments)]
+fn render_button<T: Copy + Send + From<u8>>(buf: &mut [T], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look, pack: fn([f32; 3], f32) -> T) -> Vec<u64> {
     let v = mirrored(p.view(), look);
     let r_pic = r * BALL;
     let hair = r_pic * (1. / (1 << 7) as f32);
@@ -1443,7 +1465,7 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
                 let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
                 let d = (dx * dx + dy * dy).sqrt();
                 if d >= r + 1. {
-                    row[px] = 0;
+                    row[px] = T::from(0);
                     continue;
                 }
                 // Across the ball's edge: at least 2³ samples.
@@ -1920,6 +1942,38 @@ mod tests {
                 z = (zz.0 + c.0, zz.1 + c.1);
             }
             assert!((z.0 - eye.0).abs() + (z.1 - eye.1).abs() < 1. / (1 << 16) as f64, "period {p}: f^p(eye) − eye = {:?}", (z.0 - eye.0, z.1 - eye.1));
+        }
+    }
+
+
+    /// `pack_g2t16` is fluor's 16-bit pixel of the colour's own light: empty is 0, opaque black all ones, diffuse white (gamma 2 value 1) VSF's 16-bit white code tanh(1)·2¹⁶ = 49 911, and the arcs above white keep codes above it; darkness never passes α.
+    #[test]
+    fn pack_g2t16_is_fluors_16_bit_light() {
+        let ch = |p: u64| [(p >> 32) & 0xFFFF, (p >> 16) & 0xFFFF, p & 0xFFFF];
+        assert_eq!(pack_g2t16([0.5; 3], 0.), 0);
+        assert_eq!(pack_g2t16([0.; 3], 1.), u64::MAX);
+        assert_eq!(ch(pack_g2t16([1.; 3], 1.)), [65535 - 49911; 3]);
+        assert!(ch(pack_g2t16([1. + ARC_HDR; 3], 1.))[0] < 65535 - 49911);
+        for a in [0.25f32, 0.5, 0.75] {
+            let p = pack_g2t16([0.3, 0.6, 0.9], a);
+            assert!(ch(p).iter().all(|&d| d <= p >> 48));
+        }
+    }
+
+    /// The 16-bit disc is the 8-bit one's picture: the same coverage at every pixel to within an 8-bit step (a sliver too thin for an 8-bit α can still show at 16), darkness within α.
+    #[test]
+    fn the_16_bit_disc_covers_the_8_bit_ones_pixels() {
+        let salt = *blake3::hash(b"depth").as_bytes();
+        let (d, p) = (1usize << 5, Params::new(&salt, ""));
+        let r = d as f32 * 0.5;
+        for look in [Look::avatar(), Look::attest()] {
+            let (mut p8, mut p16) = (vec![0u32; d * d], vec![0u64; d * d]);
+            render_disc(&mut p8, d, r, r, r, &p, &look);
+            render_disc_g2t16(&mut p16, d, r, r, r, &p, &look);
+            for (a, b) in p8.iter().zip(&p16) {
+                assert!([32, 16, 0].iter().all(|&s| (b >> s) & 0xFFFF <= b >> 48));
+                assert!(((a >> 24) as i64 - (b >> 56) as i64).abs() <= 1, "α {a:08x} against {b:016x}");
+            }
         }
     }
 
