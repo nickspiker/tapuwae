@@ -668,12 +668,21 @@ fn oklab(l: f32, a: f32, b: f32) -> [f32; 3] {
     .map(|c| c.sqrt())
 }
 
-/// The soft colour at lightness `l`, saturation `sat` (chroma = sat·l), hue offset `dh` from the theme's base, plus a tint (an OKLab (a, b) offset in units of l).
-/// The theme's saturations stay at most 0.124 and the tints add at most 0.04, so the chroma stays under 0.164·l, inside the gamut at every lightness (its all-hue limit is about 0.17·l).
+/// The soft colour at lightness `l`, saturation `sat` (chroma = sat·l), hue offset `dh` from the theme's base, plus a tint (an OKLab (a, b) offset in units of l), always inside the display's gamut, smoothly.
+/// Lightness passes a shoulder: unchanged up to 0.85, then easing toward 0.95 as 0.85 + 0.1·tanh((L − 0.85)/0.1), so the brightest grounds, glows and lit faces never wash out to white.
+/// Chroma (the theme's and the tint's together) is then held under the gamut at that lightness, which is about 0.17·L at the dark end (where a channel would go negative) and about 0.49·(1 − L) at the light end (where one would pass 1), measured over every hue: the cap is the smooth minimum of 0.16·L and 0.48·(1 − L), and the chroma eases into it as cap·tanh(C/cap), C∞ and nearly unchanged well inside it.
 #[inline]
 fn soft(th: &Theme, l: f32, sat: f32, dh: f32, tint: (f32, f32)) -> [f32; 3] {
+    let (knee, room) = (0.85f32, 0.1f32);
+    let l = if l > knee { knee + room * ((l - knee) / room).tanh() } else { l };
     let (h, c) = (th.hue + dh, sat * l);
-    oklab(l, c * h.cos() + tint.0 * l, c * h.sin() + tint.1 * l)
+    let (a, b) = (c * h.cos() + tint.0 * l, c * h.sin() + tint.1 * l);
+    let cm = (a * a + b * b).sqrt();
+    let (lo, hi) = (0.16 * l, 0.48 * (1. - l));
+    let d = 1. / (1 << 6) as f32;
+    let cap = 0.5 * (lo + hi - ((lo - hi) * (lo - hi) + d * d).sqrt());
+    let scale = if cm > 0. && cap > 0. { cap * (cm / cap).tanh() / cm } else { 0. };
+    oklab(l, a * scale, b * scale)
 }
 
 /// A smooth (C∞) split of a signed amount into its positive part, (x + √(x² + δ²))/2 with δ = 2⁻⁶: about x when well positive, about 0 when well negative, and no corner at 0.
@@ -975,16 +984,16 @@ mod tests {
         }
     }
 
-    /// Every colour the shading can ask for has no negative channel, at every hue: lightness from the darkest ink line on the darkest ground under both lamps' deepest shade (0.38 − (0.1 + 0.05)·(1 + 0.92) − 2⁻⁶ ≈ 0.08) up to 1, at the most saturation any layer gets (0.124) with the most tint (0.04) added in the same direction. A channel past 1 is fine: the pack saturates it.
+    /// Every colour the shading can ask for stays inside the display's gamut at every hue: no channel below 0 or above 1 (a hair of rounding allowed), for lightness from 0.05 to past white (the shoulder brings it in) at the most saturation and tint any layer gets, and beyond.
     #[test]
     fn soft_colours_stay_in_gamut() {
         let mut th = Theme::from_bytes(&[0; 32]);
         for i in 0..(1 << 8) {
             th.hue = i as f32 / (1 << 8) as f32 * TAU as f32;
-            for l in [0.05f32, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 0.9, 1.] {
-                for sat in [0f32, 0.07, 0.124] {
+            for l in [0.05f32, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1., 1.2] {
+                for sat in [0f32, 0.07, 0.124, 0.2] {
                     let rgb = soft(&th, l, sat, 0., (0.04 * th.hue.cos(), 0.04 * th.hue.sin()));
-                    assert!(rgb.iter().all(|x| x.is_finite() && *x >= 0.), "hue {i}, L {l}, sat {sat}: {rgb:?}");
+                    assert!(rgb.iter().all(|x| x.is_finite() && *x >= 0. && *x <= 1. + 1. / (1 << 10) as f32), "hue {i}, L {l}, sat {sat}: {rgb:?}");
                 }
             }
         }
