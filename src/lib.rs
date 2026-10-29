@@ -1470,7 +1470,7 @@ fn mirrored(mut v: View, look: &Look) -> View {
 /// The fresh mark (attest, a device no identity has attested on yet): the Mandelbrot set itself, antenna up, filling a disc of radius `r` pixels centred at (`cx`, `cy`), in the device's colour, with the device's attest ball inside every hyperbolic component; everything from `salt` (the device's own, from its ira), and the ball also from `text`, the textbox, as the attest ball follows it (each character nudging it, `Params::new`).
 /// Outside is black, with a glow from the distance estimate shaped as ferros's circles glow (`render_button`): the set's line at full light, a halo at half, down by the same step every octave of distance, gone 1/GLOW_FRACTION of `r` out. It never depends on the text.
 /// Inside, a component is a disc to its multiplier λ (the attracting cycle's (fᵖ)′, a conformal map of the component onto the unit disc, 0 at its centre and of size 1 on its rim): the main cardioid and the period-2 disc have it in closed form (1 − √(1 − 4c) and 4(c + 1)); every other point iterates 2⁹ steps to settle, then finds its cycle (the first return within 2⁻²⁰) and multiplies 2z around it.
-/// The disc is the attest ball's disc, point for point: the same view, `shade` and `Look::attest()` (style, material, engraving, mirror, electric flame), tapering by the vignette into the device's colour at the rim, which is the colour of the set's line outside, so every component blends into the outline. The ball's scale in pixels is the component's: its radius is 1/|dλ/dpixel| (in closed form for the cardioid and the period-2 disc, |λ′| = 2/|√(1 − 4c)| and 4; elsewhere λ again half a pixel along and the difference), and its lines are 2⁻⁷ of that, as the ball's are of its own.
+/// The disc is the attest ball's disc, point for point: the same view, `shade` and `Look::attest()` (style, material, engraving, mirror, electric flame), tapering into the device's colour at the rim by √(1 − |p|²) rather than the button's twelfth power, which is the colour of the set's line outside, so every component blends into the outline. The ball's scale in pixels is the component's: its radius is 1/|dλ/dpixel| (in closed form for the cardioid and the period-2 disc, |λ′| = 2/|√(1 − 4c)| and 4; elsewhere λ again half a pixel along and the difference), and its lines are 2⁻⁷ of that, as the ball's are of its own.
 /// Where no cycle is found within 2⁶ steps (right at a rim, converging slowly, or a period past 2⁶) the device's colour stands, as the ball's rim does.
 /// `inside` is a bitmask of the pixels (one bit per pixel of `buf`, 64 a word, row after row) that hold any of a component: with `full` every pixel renders and the mask is written; without, only the masked pixels render, so a new `text` redraws the balls and leaves the outline as it was.
 /// Sampling: a `k` × `k` stratified grid per pixel, averaged in linear light with coverage (the glow is light over the background, coverage its brightness).
@@ -1478,7 +1478,8 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
     let th = Theme::from_bytes(&draw(salt, 1, 0, &[]));
     let aura = soft(&th, 0.72, 0.15, 0., (0., 0.));
     // The attest ball, as `render_button` draws it.
-    let look = Look::attest();
+    // The attest ball's look, but tapering into the device's colour by √(1 − |p|²) (owner, 2026-10-29): in a component it reads as a lit sphere glowing into the outline, not a button; the bound identity's mark keeps √(1 − |p|¹²).
+    let look = Look { vignette: 2, ..Look::attest() };
     let params = Params::new(salt, text);
     let v = mirrored(params.view(), &look);
     let rad = params.radius as f32;
