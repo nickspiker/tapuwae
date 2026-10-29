@@ -1210,7 +1210,7 @@ fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), ha
     };
     // The electric flame (attest): arcs where the flame's real or imaginary part, at the device's `arcs` times its own scale, crosses a whole number — the contours that curl off the set as tongues. Each arc is a core (2⁻⁴ of a contour wide) inside a halo (¼ of one wide, falling off as 1/(1 + x²)), and between them wisps: the same contours at 2² times the density, a thin core 2⁻⁵ wide in the arc's colour, a touch toward white, and no halo.
     // Chromatic: an arc along one part takes its colour from the other part, the hue swinging up to a third of a turn either side of the theme's as the arc runs, so one arc passes through neighbouring hues; its core is that colour run toward white, hot but not blank.
-    // Added as light with a screen blend (on a ground dimmed by ⅜, a plasma globe's dark glass), so it brightens without clipping. Like the ripple, it fades in away from the set, where its contours would crowd into noise, and the wisps, four times denser, fade in further out.
+    // Added as light with a screen blend (on a ground dimmed by ⅜, a plasma globe's dark glass), so it brightens without clipping, and the cores past white (ARC_HDR). Like the ripple, it fades in away from the set, where its contours would crowd into noise, and the wisps, four times denser, fade in further out.
     let rgb = if look.electric > 0. {
         pick(escaped, || {
             let line = |x: L, core_w: f32| {
@@ -1233,7 +1233,9 @@ fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), ha
                 let wisp = |k: [L; 3], w: L| (k[i] * 0.625 + 0.125) * w * wisp_fade;
                 let e = one - (one - arc(k0, c0, h0)) * (one - arc(k1, c1, h1)) * (one - wisp(k0, w0)) * (one - wisp(k1, w1));
                 let base = rgb[i] * (1. - 0.375 * look.electric);
-                base + e * (one - base)
+                // Past white (owner, 2026-10-29: ferros's 16-bit pipeline holds to 4.0 in gamma 2): the cores burn on above the blend by up to ARC_HDR, white, which the display rolls off; an 8-bit fluor pixel clips them at white, as they always looked there.
+                let core = (c0 + c1 - c0 * c1) * fade;
+                base + e * (one - base) + core * ARC_HDR
             })
         }, rgb)
     } else {
@@ -1242,6 +1244,9 @@ fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), ha
     (rgb, dist_px)
 }
 
+
+/// How far past white an electric arc's core burns, in gamma-2 units above 1: 1 puts the hottest at 2.0, four times white light (ferros's surface holds to 4.0, sixteen times).
+const ARC_HDR: f32 = 1.;
 
 /// A visible colour in [0, 1] per channel at opacity α in [0, 1], as a fluor α + darkness pixel: darkness is premultiplied by α (an empty pixel is 0, opaque black is all ones).
 #[inline]
