@@ -570,6 +570,8 @@ pub enum Aa {
     Doubling { threshold: f32, min_log2: u32, max_log2: u32 },
     /// Exactly n samples (a ground truth to measure the others against).
     Fixed(u32),
+    /// k × k samples, one at a jittered point in each cell of a k × k grid over the pixel (stratified): the pixel covered evenly, with no two samples crowding the same corner, and no regular pattern to alias.
+    Stratified(u32),
 }
 
 /// Whether a look shows an attest feature: never (Photon's avatars), as the device drew it, or one kind forced (for comparing kinds side by side).
@@ -1347,6 +1349,7 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
         Aa::Linear => MAX_SAMPLES,
         Aa::Doubling { max_log2, .. } => 1 << max_log2,
         Aa::Fixed(n) => n as usize,
+        Aa::Stratified(k) => (k * k) as usize,
     };
     buf.par_chunks_mut(w)
         .enumerate()
@@ -1368,6 +1371,8 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
                 let (mut before, mut before_cover, mut pass_end) = ([0f32; 3], 0f32, 1usize);
                 loop {
                     let (jx, jy) = jitter(px as u32, py as u32, m as u32);
+                    // Stratified: the m-th sample in cell (m mod k, m div k) of the k × k grid.
+                    let (jx, jy) = if let Aa::Stratified(k) = look.aa { let (kf, mu) = (k as f32, m as u32); (((mu % k) as f32 + jx) / kf, ((mu / k) as f32 + jy) / kf) } else { (jx, jy) };
                     let (s, a) = sample(px as f32 + jx - cx, py as f32 + jy - cy);
                     // Linear: the newest sample against the mean of the ones before it, premultiplied, in 8-bit display levels (coverage counted as a fourth channel).
                     let spread = if look.aa == Aa::Linear && m > 0 {
@@ -1385,7 +1390,7 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
                     m += 1;
                     let done = match look.aa {
                         Aa::Linear => m >= cap || (m >= least && spread <= m as f32),
-                        Aa::Fixed(_) => m >= cap,
+                        Aa::Fixed(_) | Aa::Stratified(_) => m >= cap,
                         Aa::Doubling { threshold, .. } => {
                             if m < pass_end {
                                 false
