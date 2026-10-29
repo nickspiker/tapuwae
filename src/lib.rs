@@ -806,53 +806,94 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     });
 }
 
+/// The most samples one pixel takes.
+pub const MAX_SAMPLES: usize = 1 << 6;
+
+/// A cheap integer hash (a 32-bit avalanche: xor-shift and multiply rounds, the constants are the mix's design) of a pixel and a sample index, as a point in the unit square.
+#[inline]
+fn jitter(px: u32, py: u32, m: u32) -> (f32, f32) {
+    let mut h = px.wrapping_mul(0x9E37_79B1) ^ py.wrapping_mul(0x85EB_CA77) ^ m.wrapping_mul(0xC2B2_AE3D);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7FEB_352D);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846C_A68B);
+    h ^= h >> 16;
+    let scale = 1. / (1u32 << 16) as f32;
+    ((h & 0xFFFF) as f32 * scale, (h >> 16) as f32 * scale)
+}
+
 /// Render the mark spherized into a disc of radius `r` pixels centred at (`cx`, `cy`) in `buf` (rows of `w`, α + darkness); pixels outside the disc are left empty (α = 0), so it can go over any background.
 /// A disc point p (in units of r) shows z = eye + R·rot·p/√(1 − |p|²): the plane wrapped onto a hemisphere seen from above, its infinity at the rim.
 /// Everything is multiplied by √(1 − |p|²), so the ball tapers to black at its rim, where the warp packs the field tightest.
 /// The disc's edge is the ordinary anti-aliased circle (as Photon's avatars): full inside r − ½, empty outside r + ½, and between them (r + ½)² − d² over (r + ½)² − (r − ½)².
-/// Pixels within 2 px of the set (by the centre sample's distance estimate) are supersampled 2 × 2, so the finest filaments stop shimmering.
+/// Sampling is adaptive and jittered: each sample sits at a hashed point inside its pixel (`jitter`, deterministic, so the same mark renders the same everywhere). Every pixel takes two; while the newest sample differs from the mean of the ones before it by more than m levels (8-bit, in the display's gamma, any channel) after m samples, the pixel takes another, up to `MAX_SAMPLES`. Samples are averaged in linear light.
 pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) {
+    render_disc_counted(buf, w, cx, cy, r, p, look);
+}
+
+/// As `render_disc`, returning how many pixels took each number of samples (index = samples taken; pixels outside the disc are not counted).
+pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) -> Vec<u64> {
     let v = p.view();
     let rad = p.radius as f32;
     let (r_in, r_out) = ((r - 0.5).max(0.), r + 0.5);
     let (r_in2, r_out2) = (r_in * r_in, r_out * r_out);
-    // One sample at disc offset (dx, dy) pixels from the centre: its colour, already tapered, and its distance to the set in pixels.
-    let sample = |dx: f32, dy: f32| -> ([f32; 3], f32) {
+    // One sample at disc offset (dx, dy) pixels from the centre: its colour (display gamma), already tapered.
+    let sample = |dx: f32, dy: f32| -> [f32; 3] {
         let (qx, qy) = (dx / r, dy / r);
         let q2 = qx * qx + qy * qy;
         // At and past the rim the taper is 0: black.
         if q2 >= 1. {
-            return ([0.; 3], f32::MAX);
+            return [0.; 3];
         }
         let g = rad / (1. - q2).sqrt();
         let (a, b) = (qx * g, qy * g);
         let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
         // Plane units per pixel: the map's area scale, √(radial · tangential stretch) = R/(1 − |p|²) per disc unit.
         let k = rad / (r * (1. - q2));
-        let (rgb, d) = shade(x, y, &v, k, look);
         let taper = (1. - q2).sqrt();
-        (rgb.map(|c| c * taper), d)
+        shade(x, y, &v, k, look).0.map(|c| c * taper)
     };
-    buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
-        for px in 0..w {
-            let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
-            let d2 = dx * dx + dy * dy;
-            if d2 >= r_out2 {
-                row[px] = 0;
-                continue;
+    buf.par_chunks_mut(w)
+        .enumerate()
+        .map(|(py, row)| {
+            let mut hist = vec![0u64; MAX_SAMPLES + 1];
+            for px in 0..w {
+                let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+                let d2 = dx * dx + dy * dy;
+                if d2 >= r_out2 {
+                    row[px] = 0;
+                    continue;
+                }
+                let cover = if d2 <= r_in2 { 1. } else { (r_out2 - d2) / (r_out2 - r_in2) };
+                // Linear-light sum of the samples so far.
+                let mut sum = [0f32; 3];
+                let mut m = 0usize;
+                loop {
+                    let (jx, jy) = jitter(px as u32, py as u32, m as u32);
+                    let s = sample(px as f32 + jx - cx, py as f32 + jy - cy);
+                    // The newest sample against the mean of the ones before it, in 8-bit display levels.
+                    let spread = if m == 0 {
+                        f32::MAX
+                    } else {
+                        let mean = sum.map(|c| (c / m as f32).sqrt());
+                        (0..3).map(|i| (s[i] - mean[i]).abs() * 255.).fold(0., f32::max)
+                    };
+                    for i in 0..3 {
+                        sum[i] += s[i] * s[i];
+                    }
+                    m += 1;
+                    // Two samples always; after that another while the last one moved by more than m − 1 levels (2 after the second, 3 after the third, …).
+                    let threshold = m as f32;
+                    if m >= MAX_SAMPLES || (m >= 2 && spread <= threshold) {
+                        break;
+                    }
+                }
+                hist[m] += 1;
+                row[px] = pack(sum.map(|c| (c / m as f32).sqrt()), cover);
             }
-            let cover = if d2 <= r_in2 { 1. } else { (r_out2 - d2) / (r_out2 - r_in2) };
-            let (centre, d) = sample(dx, dy);
-            let rgb = if d < 2. {
-                let q = 0.25;
-                let s = [sample(dx - q, dy - q).0, sample(dx + q, dy - q).0, sample(dx - q, dy + q).0, sample(dx + q, dy + q).0];
-                [0, 1, 2].map(|i| (s[0][i] + s[1][i] + s[2][i] + s[3][i]) * 0.25)
-            } else {
-                centre
-            };
-            row[px] = pack(rgb, cover);
-        }
-    });
+            hist
+        })
+        .reduce(|| vec![0u64; MAX_SAMPLES + 1], |a, b| a.iter().zip(&b).map(|(x, y)| x + y).collect())
 }
 
 /// Where this picture came from in the Mandelbrot set: the Julia set's c.
