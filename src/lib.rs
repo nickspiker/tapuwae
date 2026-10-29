@@ -537,6 +537,8 @@ struct Attest {
     metal_b: u8,
     /// The enamel's cell colours: a seed for which of the four each cell takes.
     cells: u32,
+    /// How densely the electric flame arcs: its contours at 2², 2³ or 2⁴ times the flame's scale (sparse, medium, a web).
+    arcs: f32,
 }
 
 impl Attest {
@@ -553,6 +555,7 @@ impl Attest {
             metal_a,
             metal_b: if a[7] & 1 == 0 { metal_a } else { (metal_a + 1 + (a[7] >> 1) % 7) & 7 },
             cells: u32::from_le_bytes([a[9], a[10], a[11], a[12]]),
+            arcs: ((2 + a[13] % 3) as f32).exp2(),
         }
     }
 }
@@ -908,12 +911,14 @@ pub struct Look {
     pub style: Pick,
     /// Wrap the picture as a round button: the ball a little smaller, over a soft drop shadow.
     pub button: bool,
+    /// The flame as electricity (attest): arcs along the flame's contours, white-hot at their cores, haloed in the device's colour, added as light; 0 off (the avatars), 1 as designed, more or less to taste.
+    pub electric: f32,
 }
 
 impl Default for Look {
     /// Photon's avatar: no offset, the device's own relief and lighting, √(1 − |p|²), no attest features.
     fn default() -> Self {
-        Look { offset: (0., 0.), relief: 1., fixed_light: false, vignette: 2, material: Pick::Off, engrave: Pick::Off, mirror: Pick::Off, style: Pick::Off, button: false }
+        Look { offset: (0., 0.), relief: 1., fixed_light: false, vignette: 2, material: Pick::Off, engrave: Pick::Off, mirror: Pick::Off, style: Pick::Off, button: false, electric: 0. }
     }
 }
 
@@ -925,7 +930,7 @@ impl Look {
 
     /// ferros's attest mark: √(1 − |p|¹²), every attest feature as the device drew it, wrapped as a button.
     pub fn attest() -> Self {
-        Look { vignette: 12, material: Pick::Device, engrave: Pick::Device, mirror: Pick::Device, style: Pick::Device, button: true, ..Look::default() }
+        Look { vignette: 12, material: Pick::Device, engrave: Pick::Device, mirror: Pick::Device, style: Pick::Device, button: true, electric: 1., ..Look::default() }
     }
 }
 
@@ -980,7 +985,14 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
         th0.ripple_a[k] * (tau * (f * ld + v.keyed.phase[k])).sin() * fade
     };
     let (rl, ra, rb) = if escaped { (wave(0) + wave(1), wave(2), wave(3)) } else { (0., 0., 0.) };
-    let breathe = (tau * im).cos() * (1. / (1 << 6) as f32) + rl;
+    // The soft flame (every look): along the flame's contours at 2² times its own scale, a gentle lightness wave (2⁻⁴ either way, from its imaginary part) and a hue wave (¼ rad either way, from its real part), so its tongues read in the open field in the theme's own tones; it fades in away from the set by its contours' crowding, as the ripple's waves do.
+    let (flame_l, flame_h) = if escaped {
+        let fade = dist_px * dist_px / (dist_px * dist_px + (1 << 4) as f32);
+        ((tau * 4. * flame.1).sin() * (1. / (1 << 4) as f32) * fade, (tau * 4. * flame.0).sin() * 0.25 * fade)
+    } else {
+        (0., 0.)
+    };
+    let breathe = (tau * im).cos() * (1. / (1 << 6) as f32) + rl + flame_l;
     // Body: within about a pixel of the set, falling smoothly (C∞) to nothing a few pixels out.
     let body = 1. / (1. + dist_px * dist_px);
     // Rim: strongest about 2¹ pixels out, a smooth bump in log distance.
@@ -1063,7 +1075,7 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
             let lightness = lightness + way * 0.125 * line;
             let sat = sat + (th.rim_s - sat) * line;
             // Hue: the ground's base, drifting toward the far field, swung by the colouring, turned by the nacre, and turned by the theme's accent on the set.
-            let rgb = soft(th, lightness, sat, th.spread * swing + th.drift * far + nacre + th.accent * body, tint);
+            let rgb = soft(th, lightness, sat, th.spread * swing + flame_h + th.drift * far + nacre + th.accent * body, tint);
             // The material (attest): a highlight of the key lamp on the ball, its normal the sphere's (`sphere`, screen x right, y down, z out) tilted by a quarter of the relief's slope, and for glass a Fresnel sheen toward the rim. Added as a screen blend, c + s·(1 − c), so it brightens without clipping.
             let material = look.material.of(v.attest.material);
             if material == 0 {
@@ -1107,13 +1119,35 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
         _ => {
             // Lacquer: the avatars' own colouring, a step darker and twice as saturated (the gamut cap in `soft` still holds it), the engraving inked in, the set raised in `metal_a`, under the same glaze as enamel.
             let way = if th.rim_l > th.ground_l { 1. } else { -1. };
-            let lacquer = soft(th, lightness * 0.75 + way * 0.125 * line, sat * 2., th.spread * swing + th.drift * far + nacre + th.accent * body, tint).map(|c| c * c * 1.25);
+            let lacquer = soft(th, lightness * 0.75 + way * 0.125 * line, sat * 2., th.spread * swing + flame_h + th.drift * far + nacre + th.accent * body, tint).map(|c| c * c * 1.25);
             let n = unit3((sphere.0 * 0.5 + rx, sphere.1 * 0.5 + ry, 1.));
             let gold = metal(METALS[v.attest.metal_a as usize], n, l);
             let lin = [0, 1, 2].map(|i| lacquer[i] + (gold[i] - lacquer[i]) * raised);
             let spec = 0.125 * facing(unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, 1.))).powi(1 << 5);
             expose(lin).map(|c| c + spec * (1. - c))
         }
+    };
+    // The electric flame (attest): arcs where the flame's real or imaginary part, at the device's `arcs` times its own scale, crosses a whole number — the contours that curl off the set as tongues. Each arc is a core (white-hot, 2⁻⁴ of a contour wide) inside a halo (the device's colour, ¼ of one wide, falling off as 1/(1 + x²)), added as light with a screen blend (on a ground dimmed by ⅜, a plasma globe's dark glass), so it brightens without clipping. Like the ripple, it fades in away from the set, where its contours would crowd into noise.
+    let rgb = if look.electric > 0. && escaped {
+        let arc = |x: f32| {
+            let s = (pi * x).sin();
+            let (c, h) = (s * (1 << 4) as f32, s * 4.);
+            ((-(c * c)).exp2(), 1. / (1. + h * h))
+        };
+        let gain = v.attest.arcs;
+        let (c0, h0) = arc(flame.0 * gain);
+        let (c1, h1) = arc(flame.1 * gain);
+        let core = 1. - (1. - c0) * (1. - c1);
+        let halo = 1. - (1. - h0) * (1. - h1);
+        let fade = dist_px * dist_px / (dist_px * dist_px + (1 << 4) as f32) * look.electric;
+        let aura = soft(th, 0.8, 0.15, 0., (0., 0.));
+        [0, 1, 2].map(|i| {
+            let e = (aura[i] * halo * 0.5 + core * 0.75) * fade;
+            let base = rgb[i] * (1. - 0.375 * look.electric);
+            base + e * (1. - base)
+        })
+    } else {
+        rgb
     };
     (rgb, dist_px)
 }
@@ -1431,7 +1465,7 @@ mod tests {
         }
     }
 
-    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the flame joined every colouring method (2026-10-29, owner-approved) (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
+    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the soft flame joined every colouring method (2026-10-29, owner-approved) (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
     #[test]
     fn avatars_hold_still() {
         let mut h = blake3::Hasher::new();
@@ -1445,7 +1479,7 @@ mod tests {
                 h.update(&p.to_le_bytes());
             }
         }
-        assert_eq!(h.finalize().to_hex().as_str(), "dc2881e43958d72c5969440a0f8bb1491685197f0856c8f6a002387546b73d4d");
+        assert_eq!(h.finalize().to_hex().as_str(), "a2c80c8a7273f537a56b41d8bd4a235ee18bca5e8d454e6297650ffcf883b737");
     }
 
     /// A spiral's eye really is periodic: f^p carries it back onto itself.
