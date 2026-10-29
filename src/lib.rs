@@ -1251,6 +1251,14 @@ fn pack(rgb: [f32; 3], alpha: f32) -> u32 {
     (a << 24) | (d(rgb[0]) << 16) | (d(rgb[1]) << 8) | d(rgb[2])
 }
 
+/// A visible colour (display gamma 2, as every colour here is) at coverage α as ferros's 16-bit surface pixel: light over black, each channel c·α in Q14 (white = 2¹⁴, the surface's own scale), red in the low 16 bits, then green and blue, and α (Q14) in the top 16. Rounded to the nearest step; the display dithers these to the panel, so a smooth glow keeps its 14 bits instead of the 8 a fluor pixel holds.
+#[inline]
+pub fn pack16(rgb: [f32; 3], alpha: f32) -> u64 {
+    let q = (1u32 << 14) as f32;
+    let ch = |c: f32| (c * alpha * q + 0.5) as u64;
+    ch(rgb[0]) | ch(rgb[1]) << 16 | ch(rgb[2]) << 32 | ((alpha * q + 0.5) as u64) << 48
+}
+
 /// Render the mark into `buf` (`w × h`, α + darkness), rows across the cores, in f32.
 pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     let k = scale(p.half, w, h);
@@ -1513,8 +1521,9 @@ const RIM: i16 = i16::MIN + 1;
 /// Where no cycle is found within 2⁶ steps (right at a rim, converging slowly, or a period past 2⁶) the device's colour stands, as the ball's rim does.
 /// `inside` is a bitmask of the pixels (one bit per pixel of `buf`, 64 a word, row after row) that hold any of a component, and `map` the masked pixels' samples (`FreshCell`, in pixel order, k² a pixel): with `full` every pixel renders and both are written; without, only the masked pixels render, from the map, so a new `text` costs the balls' shading alone and leaves the outline as it was. A map too short for every masked sample holds the first ones; the rest are worked out again each time. The full render draws from the cells as stored, so the first keystroke moves nothing but the ball.
 /// Sampling: one sample at a pixel's centre outside the components; a `k` × `k` stratified grid per pixel that touches one, averaged in linear light with coverage (the glow is light over the background, coverage its brightness), the grid's cells kept in the map.
+/// The pixels are ferros's 16-bit surface pixels (`pack16`): the mark goes to a 16-bit pipeline, so it keeps 14 bits a channel through to the display's dither (owner, 2026-10-29), not a fluor pixel's 8.
 /// Two passes for latency (owner, 2026-10-29): a coarse one (`fine` false) draws each component pixel from the one cell nearest its centre, four pixels to a lane call, to be on the glass at once; a fine one draws all k² cells to clear it up a moment later. `stop` is asked before every row: true leaves the pass where it is and returns false (a newer handle is waiting); a finished pass returns true.
-pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], text: &str, k: u32, inside: &mut [u64], map: &mut [FreshCell], full: bool, fine: bool, stop: &dyn Fn() -> bool) -> bool {
+pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], text: &str, k: u32, inside: &mut [u64], map: &mut [FreshCell], full: bool, fine: bool, stop: &dyn Fn() -> bool) -> bool {
     let th = Theme::from_bytes(&draw(salt, 1, 0, &[]));
     let aura = soft(&th, 0.72, 0.15, 0., (0., 0.));
     // The attest ball's look, but tapering into the device's colour by √(1 − |p|²) (owner, 2026-10-29): in a component it reads as a lit sphere glowing into the outline, not a button; the bound identity's mark keeps √(1 − |p|¹²).
@@ -1635,7 +1644,7 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
     // A coarse pass's component pixels waiting for a lane call: (pixel, cell).
     let mut pend = [(0usize, [0i16; 3]); 4];
     let mut np = 0;
-    let flush = |pend: &[(usize, FreshCell)], buf: &mut [u32]| {
+    let flush = |pend: &[(usize, FreshCell)], buf: &mut [u64]| {
         if pend.is_empty() {
             return;
         }
@@ -1645,7 +1654,7 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
         }
         let cols = shade4(&cs[..pend.len()]);
         for (j, &(i, _)) in pend.iter().enumerate() {
-            buf[i] = pack(cols[j], 1.);
+            buf[i] = pack16(cols[j], 1.);
         }
     };
     // The next map entry, across the masked pixels' samples in order.
@@ -1666,7 +1675,7 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
                 if centre_cell[2] == OUTSIDE {
                     inside[i >> 6] &= !(1u64 << (i & 63));
                     let (s, a) = plain(centre_cell);
-                    buf[i] = pack(s, a);
+                    buf[i] = pack16(s, a);
                     continue;
                 }
             }
@@ -1701,7 +1710,7 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
                 let c = cells[m0];
                 if c[2] == OUTSIDE || c[2] == RIM {
                     let (s, a) = plain(c);
-                    buf[i] = pack(s, a);
+                    buf[i] = pack16(s, a);
                 } else {
                     pend[np] = (i, c);
                     np += 1;
@@ -1744,7 +1753,7 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
                 cover += a;
             }
             let rgb = if cover > 0. { sum.map(|c| (c / cover).sqrt()) } else { [0.; 3] };
-            buf[i] = pack(rgb, cover / kk2 as f32);
+            buf[i] = pack16(rgb, cover / kk2 as f32);
         }
     }
     flush(&pend[..np], buf);
