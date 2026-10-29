@@ -782,14 +782,14 @@ pub struct Look {
     pub relief: f32,
     /// One fixed light for every device (`Lighting::fixed`) instead of each device's own.
     pub fixed_light: bool,
-    /// The rim vignette's power: the disc is multiplied by √(1 − |p|²) raised to this (1 for Photon's avatars; ferros's attest screen uses 4, (1 − |p|²)², for a deeper black rim).
+    /// The rim vignette's radial power k: the disc is multiplied by √(1 − |p|^k) (2 for Photon's avatars; ferros's attest screen uses 4, √(1 − |p|⁴), which stays bright further out and falls to black in a tighter band at the rim).
     pub vignette: i32,
 }
 
 impl Default for Look {
     /// No offset, the device's own relief and lighting.
     fn default() -> Self {
-        Look { offset: (0., 0.), relief: 1., fixed_light: false, vignette: 1 }
+        Look { offset: (0., 0.), relief: 1., fixed_light: false, vignette: 2 }
     }
 }
 
@@ -928,7 +928,7 @@ fn jitter(px: u32, py: u32, m: u32) -> (f32, f32) {
 
 /// Render the mark spherized into a disc of radius `r` pixels centred at (`cx`, `cy`) in `buf` (rows of `w`, α + darkness); pixels outside the disc are left empty (α = 0), so it can go over any background.
 /// A disc point p (in units of r) shows z = eye + R·rot·p/√(1 − |p|²): the plane wrapped onto a hemisphere seen from above, its infinity at the rim.
-/// Everything is multiplied by √(1 − |p|²) raised to the look's `vignette` power, so the ball tapers to black at its rim, where the warp packs the field tightest.
+/// Everything is multiplied by √(1 − |p|^k), k the look's `vignette`, so the ball tapers to black at its rim, where the warp packs the field tightest.
 /// The disc's edge is the ordinary anti-aliased circle (as Photon's avatars): full inside r − ½, empty outside r + ½, and between them (r + ½)² − d² over (r + ½)² − (r − ½)².
 /// Sampling is adaptive and jittered: each sample sits at a hashed point inside its pixel (`jitter`, deterministic, so the same mark renders the same everywhere). Every pixel takes two; while the newest sample differs from the mean of the ones before it by more than m levels (8-bit, in the display's gamma, any channel) after m samples, the pixel takes another, up to `MAX_SAMPLES`. Samples are averaged in linear light.
 pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) {
@@ -954,7 +954,8 @@ pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, 
         let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
         // Plane units per pixel: the map's area scale, √(radial · tangential stretch) = R/(1 − |p|²) per disc unit.
         let k = rad / (r * (1. - q2));
-        let taper = (1. - q2).sqrt().powi(look.vignette);
+        // |p|^k as (|p|²)^(k/2): k is even in every use, so it stays a whole power.
+        let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
         shade(x, y, &v, k, look).0.map(|c| c * taper)
     };
     buf.par_chunks_mut(w)
