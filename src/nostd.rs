@@ -1,19 +1,14 @@
 //! The float maths std gives f32 and f64 as methods, for a build without std (ferros's no_std processes, ahau's attest screen): the same names as methods, from libm, so the renderer reads the same either way.
 //! With std these are not compiled and the inherent methods are used; results can differ in the last bits between the two (libm against the platform's), so the avatars' pinned hash is a std build's.
 
+/// sqrt, floor and powi come from the render's `Lane` (lanes.rs), which gives f32 libm's same functions without std; here they would be a second trait method of the same name and every call ambiguous.
 pub trait F32Math {
-    fn sqrt(self) -> f32;
     fn exp2(self) -> f32;
     fn sin(self) -> f32;
     fn cos(self) -> f32;
-    fn floor(self) -> f32;
-    fn powi(self, n: i32) -> f32;
 }
 
 impl F32Math for f32 {
-    fn sqrt(self) -> f32 {
-        libm::sqrtf(self)
-    }
     fn exp2(self) -> f32 {
         libm::exp2f(self)
     }
@@ -22,12 +17,6 @@ impl F32Math for f32 {
     }
     fn cos(self) -> f32 {
         libm::cosf(self)
-    }
-    fn floor(self) -> f32 {
-        libm::floorf(self)
-    }
-    fn powi(self, n: i32) -> f32 {
-        libm::powf(self, n as f32)
     }
 }
 

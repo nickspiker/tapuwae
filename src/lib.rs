@@ -34,6 +34,8 @@ use rayon::prelude::*;
 
 mod fm;
 use fm::Fast;
+mod lanes;
+use lanes::{live, pick, select, Bits, Lane, Mask, F4};
 #[cfg(not(feature = "std"))]
 mod nostd;
 #[cfg(not(feature = "std"))]
@@ -151,93 +153,113 @@ fn cmul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
     (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
 }
 
-/// What one orbit did: iterations until escape (MAX_ITER if it never did), z at escape, the derivative's magnitude, and the closest approach to the trap point (squared).
-struct Orbit {
-    n: u32,
-    x: f32,
-    y: f32,
-    dm: f32,
-    trap_sq: f32,
+/// What one orbit did, per lane: iterations until escape (MAX_ITER if it never did), z at escape, the derivative's magnitude, and the closest approach to the trap point (squared).
+/// The counts (`n`, `dm_exp`) are whole numbers held as floats, exact far past any count here, so four lanes keep them in one register beside the rest.
+struct Orbit<L> {
+    n: L,
+    x: L,
+    y: L,
+    dm: L,
+    trap_sq: L,
     /// |dz/dz₀| = dm · 2^dm_exp: the magnitude is rescaled by 2⁻⁶⁴ whenever it passes 2⁶⁴, so it never overflows f32 however long the orbit stays near the set (an overflowed derivative read as distance 0, a band of false "on the set" pixels).
-    dm_exp: i32,
+    dm_exp: L,
     /// The flames, from mandelbrot-exploder (compute/mandelbrot_f64.rs, OrbitTrackerf64): weighted means over the orbit, `fq` of z (weight iter²/|z|, tapered as the orbit escapes) and `fc` of 1/z (weight 1/|z|).
-    fq: (f32, f32),
-    fc: (f32, f32),
+    fq: (L, L),
+    fc: (L, L),
     /// The direction of z / (dz/dz₀) at escape, a unit complex number: the outward normal of the potential's level line, the "slope" the set's relief would have there (Julia sets only; (0, 0) in the parameter plane).
-    ux: f32,
-    uy: f32,
+    ux: L,
+    uy: L,
     /// The orbit where it first passed |z| = 2⁸ (`ENGRAVE_SQ`): its level `lv` (that crossing's smooth count, m + 1 − log₂(ln|z_m|² / ln 2¹⁶), an integer exactly on the crossing), its angle `ray` in turns, and ln of how fast that angle turns per plane unit, ln(|dz_m/dz₀| / |z_m|). All 0 if it never got there.
-    lv: f32,
-    ray: f32,
-    ln_turn: f32,
+    lv: L,
+    ray: L,
+    ln_turn: L,
 }
 
 /// Iterate z² + c from the plane point (px, py): z₀ = that point in a Julia set, c = that point in the parameter plane.
 /// The derivative is tracked by magnitude only (|dz| ← 2·|z|·|dz|, plus 1 in the parameter plane), which is all the distance estimate needs.
 /// It can overflow to infinity near the set, which the distance estimate reads, correctly, as "on the set".
+/// Four lanes iterate together until the last of them escapes (or MAX_ITER): a lane that has escaped is frozen (`live`), so what it returns is its state at its own escape, exactly as one lane alone returns at it.
 #[inline]
-fn orbit(px: f32, py: f32, v: &View) -> Orbit {
+fn orbit<L: Lane>(px: L, py: L, v: &View) -> Orbit<L> {
+    let (zero, one) = (L::splat(0.), L::splat(1.));
     let (mut z, c, mut plus, mut dm) = match v.kind {
-        Kind::Plane => ((0f32, 0f32), (px, py), 1f32, 0f32),
-        Kind::Julia => ((px, py), v.c, 0., 1.),
+        Kind::Plane => ((zero, zero), (px, py), one, zero),
+        Kind::Julia => ((px, py), (L::splat(v.c.0), L::splat(v.c.1)), zero, one),
     };
     let julia = v.kind == Kind::Julia;
-    let mut trap_sq = f32::MAX;
+    let mut trap_sq = L::splat(f32::MAX);
     // The derivative's direction, a unit complex number: dz ← 2·z·dz turns it by arg z each step. Kept apart from its magnitude (dm) so it never overflows, however close to the set.
-    let mut dir = (1f32, 0f32);
+    let mut dir = (one, zero);
     // The flame sums and weights.
-    let (mut fq, mut fq_w, mut fc, mut fc_w) = ((0f32, 0f32), 0f32, (0f32, 0f32), 0f32);
+    let (mut fq, mut fq_w, mut fc, mut fc_w) = ((zero, zero), zero, (zero, zero), zero);
     // The taper's scale: ln ln of the escape.
     let lnln_bail = BAIL_SQ_F32.fln().fln();
     let ln_2ln2 = (2. * 2f32.fln()).fln();
-    let mut dm_exp = 0i32;
-    let (mut lv, mut ray, mut ln_turn, mut engraved) = (0f32, 0f32, 0f32, false);
-    let finish = |fq: (f32, f32), fq_w: f32, fc: (f32, f32), fc_w: f32| ((fq.0 / fq_w, fq.1 / fq_w), (fc.0 / fc_w, fc.1 / fc_w));
+    let mut dm_exp = zero;
+    let (mut lv, mut ray, mut ln_turn, mut engraved) = (zero, zero, zero, L::M::splat(false));
+    // The lanes still iterating, and the iteration each escaped at.
+    let mut running = L::M::splat(true);
+    let mut n_esc = L::splat(MAX_ITER as f32);
     for n in 0..MAX_ITER {
         let (x2, y2) = (z.0 * z.0, z.1 * z.1);
         let r2 = x2 + y2;
-        if r2 > BAIL_SQ_F32 {
-            // u = z / dz, as a direction: z/|z| times the conjugate of dz's direction.
-            let rz = r2.sqrt();
-            let (zx, zy) = (z.0 / rz, z.1 / rz);
-            let (ux, uy) = if julia { (zx * dir.0 + zy * dir.1, zy * dir.0 - zx * dir.1) } else { (0., 0.) };
-            let (fq, fc) = finish(fq, fq_w, fc, fc_w);
-            return Orbit { n, x: z.0, y: z.1, dm, dm_exp, trap_sq, fq, fc, ux, uy, lv, ray, ln_turn };
+        let esc = running & r2.gt(L::splat(BAIL_SQ_F32));
+        if esc.any() {
+            n_esc = select(esc, L::splat(n as f32), n_esc);
+            running = running & !esc;
+            if !running.any() {
+                break;
+            }
         }
-        if !engraved && r2 > ENGRAVE_SQ {
-            engraved = true;
-            lv = n as f32 + 1. - (r2.fln() / ENGRAVE_SQ.fln()).flog2();
-            ray = z.1.fatan2(z.0) * (1. / TAU as f32);
-            ln_turn = dm.fln() + dm_exp as f32 * core::f32::consts::LN_2 - 0.5 * r2.fln();
+        let first = running & !engraved & r2.gt(L::splat(ENGRAVE_SQ));
+        if first.any() {
+            engraved = engraved | first;
+            lv = select(first, L::splat(n as f32 + 1.) - (r2.fln() / ENGRAVE_SQ.fln()).flog2(), lv);
+            ray = select(first, z.1.fatan2(z.0) * (1. / TAU as f32), ray);
+            ln_turn = select(first, dm.fln() + dm_exp * core::f32::consts::LN_2 - r2.fln() * 0.5, ln_turn);
         }
         let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
-        trap_sq = trap_sq.min(tx * tx + ty * ty);
+        trap_sq = live::<L, _>(running, trap_sq.min(tx * tx + ty * ty), trap_sq);
         let rz = r2.sqrt();
         // Flames: iter² weights; past |z|² = 4 the z-flame tapers as (1 − ((ln ln |z|² − ln(2 ln 2)) / ln ln bail)²)⁶, which is in [0, 1] there because |z|² > 4 makes ln ln |z|² > ln(2 ln 2).
         let it = (n + 1) as f32;
         let it2 = it * it;
-        let taper = if r2 > 4. { let t = (r2.fln().fln() - ln_2ln2) / lnln_bail; let t = 1. - t * t; let t = t * t; t * t * t } else { 1. };
+        let taper = pick(running & r2.gt(L::splat(4.)), || { let t = (r2.fln().fln() - ln_2ln2) / lnln_bail; let t = one - t * t; let t = t * t; t * t * t }, one);
         let wq = taper * it2;
-        fq_w += wq;
-        fq = (fq.0 + z.0 * wq / rz, fq.1 + z.1 * wq / rz);
-        fc_w += 1. / rz;
-        fc = (fc.0 + z.0 / r2, fc.1 - z.1 / r2);
-        dm = 2. * rz * dm + plus;
-        if dm > (1u64 << 63) as f32 * 2. {
+        fq_w = live::<L, _>(running, fq_w + wq, fq_w);
+        fq = live::<L, _>(running, (fq.0 + z.0 * wq / rz, fq.1 + z.1 * wq / rz), fq);
+        fc_w = live::<L, _>(running, fc_w + one / rz, fc_w);
+        fc = live::<L, _>(running, (fc.0 + z.0 / r2, fc.1 - z.1 / r2), fc);
+        let dm_next = rz * 2. * dm + plus;
+        // Only a running lane rescales: a frozen one's derivative would keep growing and move its dm_exp after its escape.
+        let big = running & dm_next.gt(L::splat((1u64 << 63) as f32 * 2.));
+        dm = live::<L, _>(running, dm_next, dm);
+        if big.any() {
             let s = 1. / ((1u64 << 63) as f32 * 2.);
-            dm *= s;
-            plus *= s;
-            dm_exp += 64;
+            dm = select(big, dm * s, dm);
+            plus = select(big, plus * s, plus);
+            dm_exp = select(big, dm_exp + 64., dm_exp);
         }
         if julia {
             let d = (dir.0 * z.0 - dir.1 * z.1, dir.0 * z.1 + dir.1 * z.0);
             let dl = (d.0 * d.0 + d.1 * d.1).sqrt();
-            dir = (d.0 / dl, d.1 / dl);
+            dir = live::<L, _>(running, (d.0 / dl, d.1 / dl), dir);
         }
-        z = (x2 - y2 + c.0, 2. * z.0 * z.1 + c.1);
+        z = live::<L, _>(running, (x2 - y2 + c.0, z.0 * 2. * z.1 + c.1), z);
     }
-    let (fq, fc) = finish(fq, fq_w, fc, fc_w);
-    Orbit { n: MAX_ITER, x: z.0, y: z.1, dm, dm_exp, trap_sq, fq, fc, ux: 0., uy: 0., lv, ray, ln_turn }
+    let escaped = n_esc.lt(L::splat(MAX_ITER as f32));
+    // u = z / dz, as a direction: z/|z| times the conjugate of dz's direction.
+    let (ux, uy) = if julia {
+        pick(escaped, || {
+            let rz = (z.0 * z.0 + z.1 * z.1).sqrt();
+            let (zx, zy) = (z.0 / rz, z.1 / rz);
+            (zx * dir.0 + zy * dir.1, zy * dir.0 - zx * dir.1)
+        }, (zero, zero))
+    } else {
+        (zero, zero)
+    };
+    let (fq, fc) = ((fq.0 / fq_w, fq.1 / fq_w), (fc.0 / fc_w, fc.1 / fc_w));
+    Orbit { n: n_esc, x: z.0, y: z.1, dm, dm_exp, trap_sq, fq, fc, ux, uy, lv, ray, ln_turn }
 }
 
 /// The plane point under pixel (px, py) of a `w × h` window, `k` plane units per pixel: centre + rot·(u + is).
@@ -865,15 +887,15 @@ impl Theme {
 /// OKLab (L, a, b) to display RGB in [0, 1]: OKLab's own matrices (Björn Ottosson's published constants, not tuning knobs) to linear sRGB, then gamma 2 (√) for display.
 /// Chroma held at most 0.156·L keeps every colour inside the sRGB gamut, so no channel goes negative (`soft_colours_stay_in_gamut` checks every hue).
 #[inline]
-fn oklab(l: f32, a: f32, b: f32) -> [f32; 3] {
-    let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;
-    let m_ = l - 0.105_561_346 * a - 0.063_854_17 * b;
-    let s_ = l - 0.089_484_18 * a - 1.291_485_5 * b;
+fn oklab<L: Lane>(l: L, a: L, b: L) -> [L; 3] {
+    let l_ = l + a * 0.396_337_78 + b * 0.215_803_76;
+    let m_ = l - a * 0.105_561_346 - b * 0.063_854_17;
+    let s_ = l - a * 0.089_484_18 - b * 1.291_485_5;
     let (l3, m3, s3) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
     [
-        4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_94 * s3,
-        -1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_38 * s3,
-        -0.004_196_086 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3,
+        l3 * 4.076_741_7 - m3 * 3.307_711_6 + s3 * 0.230_969_94,
+        l3 * -1.268_438 + m3 * 2.609_757_4 - s3 * 0.341_319_38,
+        l3 * -0.004_196_086 - m3 * 0.703_418_6 + s3 * 1.707_614_7,
     ]
     .map(|c| c.sqrt())
 }
@@ -882,24 +904,24 @@ fn oklab(l: f32, a: f32, b: f32) -> [f32; 3] {
 /// Lightness passes a shoulder: unchanged up to 0.85, then easing toward 0.95 as 0.85 + 0.1·tanh((L − 0.85)/0.1), so the brightest grounds, glows and lit faces never wash out to white.
 /// Chroma (the theme's and the tint's together) is then held under the gamut at that lightness, which is about 0.17·L at the dark end (where a channel would go negative) and about 0.49·(1 − L) at the light end (where one would pass 1), measured over every hue: the cap is the smooth minimum of 0.16·L and 0.48·(1 − L), and the chroma eases into it as cap·tanh(C/cap), C∞ and nearly unchanged well inside it.
 #[inline]
-fn soft(th: &Theme, l: f32, sat: f32, dh: f32, tint: (f32, f32)) -> [f32; 3] {
+fn soft<L: Lane>(th: &Theme, l: L, sat: L, dh: L, tint: (L, L)) -> [L; 3] {
     let (knee, room) = (0.85f32, 0.1f32);
-    let l = if l > knee { knee + room * ((l - knee) / room).ftanh() } else { l };
-    let (h, c) = (th.hue + dh, sat * l);
+    let l = pick(l.gt(L::splat(knee)), || ((l - knee) / room).ftanh() * room + knee, l);
+    let (h, c) = (dh + th.hue, sat * l);
     let (a, b) = (c * h.fcos() + tint.0 * l, c * h.fsin() + tint.1 * l);
     let cm = (a * a + b * b).sqrt();
-    let (lo, hi) = (0.16 * l, 0.48 * (1. - l));
+    let (lo, hi) = (l * 0.16, (L::splat(1.) - l) * 0.48);
     let d = 1. / (1 << 6) as f32;
-    let cap = 0.5 * (lo + hi - ((lo - hi) * (lo - hi) + d * d).sqrt());
-    let scale = if cm > 0. && cap > 0. { cap * (cm / cap).ftanh() / cm } else { 0. };
+    let cap = (lo + hi - ((lo - hi) * (lo - hi) + d * d).sqrt()) * 0.5;
+    let scale = pick(cm.gt(L::splat(0.)) & cap.gt(L::splat(0.)), || cap * (cm / cap).ftanh() / cm, L::splat(0.));
     oklab(l, a * scale, b * scale)
 }
 
 /// A smooth (C∞) split of a signed amount into its positive part, (x + √(x² + δ²))/2 with δ = 2⁻⁶: about x when well positive, about 0 when well negative, and no corner at 0.
 #[inline]
-fn positive_part(x: f32) -> f32 {
+fn positive_part<L: Lane>(x: L) -> L {
     let d = 1. / (1 << 6) as f32;
-    0.5 * (x + (x * x + d * d).sqrt())
+    (x + (x * x + d * d).sqrt()) * 0.5
 }
 
 /// The metals' colours in linear light, each its reflectance at normal incidence (published F0 measurements; rose gold and blued titanium as their alloys and oxide show): gold, silver, copper, bronze, steel, rose gold, brass, titanium.
@@ -916,29 +938,29 @@ const METALS: [[f32; 3]; 8] = [
 
 /// A studio around the picture, as a metal sees it: the brightness reflected along `rr` (a unit vector, screen x right, y down, z out), a bright sky above falling smoothly to a dim floor below, and a faint soft-box at the key lamp `l`.
 #[inline]
-fn studio(rr: (f32, f32, f32), l: (f32, f32, f32)) -> f32 {
-    let sky = 0.5 - 0.5 * (3. * rr.1).ftanh();
+fn studio<L: Lane>(rr: (L, L, L), l: (f32, f32, f32)) -> L {
+    let sky = L::splat(0.5) - (rr.1 * 3.).ftanh() * 0.5;
     let lamp = positive_part(rr.0 * l.0 + rr.1 * l.1 + rr.2 * l.2).powi(1 << 5);
-    0.0625 + 0.5 * sky + 0.375 * lamp
+    sky * 0.5 + 0.0625 + lamp * 0.375
 }
 
 /// A metal of colour `base` (linear) with unit normal `n`, lit by the studio: the view straight down the z axis reflected about n, tinted by the metal, in linear light.
 #[inline]
-fn metal(base: [f32; 3], n: (f32, f32, f32), l: (f32, f32, f32)) -> [f32; 3] {
-    let rr = (2. * n.2 * n.0, 2. * n.2 * n.1, 2. * n.2 * n.2 - 1.);
+fn metal<L: Lane>(base: [L; 3], n: (L, L, L), l: (f32, f32, f32)) -> [L; 3] {
+    let rr = (n.2 * 2. * n.0, n.2 * 2. * n.1, n.2 * 2. * n.2 - 1.);
     let e = studio(rr, l);
     base.map(|b| b * e)
 }
 
 /// Linear light to display, through the exposure curve 1 − e^(−c) (C∞, every brightness lands below white, highlights roll off instead of clipping), then gamma 2.
 #[inline]
-fn expose(lin: [f32; 3]) -> [f32; 3] {
-    lin.map(|c| (1. - (-c).fexp()).sqrt())
+fn expose<L: Lane>(lin: [L; 3]) -> [L; 3] {
+    lin.map(|c| (L::splat(1.) - (-c).fexp()).sqrt())
 }
 
 /// A unit vector.
 #[inline]
-fn unit3(v: (f32, f32, f32)) -> (f32, f32, f32) {
+fn unit3<L: Lane>(v: (L, L, L)) -> (L, L, L) {
     let l = (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt();
     (v.0 / l, v.1 / l, v.2 / l)
 }
@@ -998,13 +1020,15 @@ fn in_plane(d: (f32, f32, f32), rot: (f32, f32)) -> (f32, f32, f32) {
 /// Lighting, from the slope itself: the picture is the surface H = −s·ln G (s = `look.relief` pixels, G the escape potential), a ridge along the set falling away into the field.
 /// Its gradient points along u = z/(dz/dz₀) (the potential's own direction, outward) with magnitude s/d per pixel at d pixels from the set (d being the distance estimate, G/|∇G| up to a constant), so its unit normal is (sin α·u, cos α) with sin α = s/√(s² + d²), cos α = d/√(s² + d²), exact and finite even on the set (d = 0).
 /// Each lamp's Lambert n·l, taken relative to a flat surface (which sees l_z), moves the lightness by strength·(n·l − l_z): faces turned to it rise, faces turned away fall, the flat field far out is untouched, and nothing is clipped. The faces a lamp lights take its tint, and the faces left in shade take the shadow tint, each split off smoothly (`positive_part`).
+/// Written once for one sample or four (`Lane`): every choice that depends on the sample is a `pick` or `select`, so four lanes take the same path; the look's and the view's choices are the same for every lane and stay `if`s.
 #[inline]
-fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32), hair: f32) -> ([f32; 3], f32) {
+fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), hair: L) -> ([L; 3], L) {
+    let (zero, one) = (L::splat(0.), L::splat(1.));
     let o = orbit(x, y, v);
     let r = (o.x * o.x + o.y * o.y).sqrt();
-    let escaped = o.n < MAX_ITER;
+    let escaped = o.n.lt(L::splat(MAX_ITER as f32));
     // Smooth iteration count, normalised to the escape: n + 1 − log₂(ln|z|² / ln bail).
-    let nu = if escaped { o.n as f32 + 1. - ((r * r).fln() / BAIL_SQ_F32.fln()).flog2() } else { MAX_ITER as f32 };
+    let nu = pick(escaped, || o.n + 1. - ((r * r).fln() / BAIL_SQ_F32.fln()).flog2(), L::splat(MAX_ITER as f32));
     let tau = TAU as f32;
     // The flame, as mandelbrot-exploder colours it: (conj(fc) − fq)·ln(smooth count)/2⁴, a complex number.
     let flame = { let g = nu.fln() * (1. / (1 << 4) as f32); ((o.fc.0 - o.fq.0) * g, (-o.fc.1 - o.fq.1) * g) };
@@ -1021,9 +1045,9 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
         _ => (flame.0, flame.1),
     };
     let (re, im) = (re + look.offset.0 + v.keyed.offset.0, im + look.offset.1 + v.keyed.offset.1);
-    let swing = (tau * re).fsin();
+    let swing = (re * tau).fsin();
     // Distance to the set: the real distance estimate, |z|·ln|z| / |dz/dz₀|, in plane units and in pixels (0 on it).
-    let dist = if escaped { r * r.fln() / o.dm * (-(o.dm_exp as f32)).fexp2() } else { 0. };
+    let dist = pick(escaped, || r * r.fln() / o.dm * (-o.dm_exp).fexp2(), zero);
     let dist_px = dist / k;
     // Distance contours: the theme's ripple, four waves across log₂ of the distance from the set, the field's own topography, their phases nudged by the key.
     // Near the set a wave of f turns per doubling has f/(d·ln 2) contours per pixel at d pixels out and would alias into hatching, so it fades in as d²/(d² + (4f/ln 2)²): gone within a few pixels of the set, full once its contours are over 4 pixels apart.
@@ -1034,19 +1058,17 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
     let wave = |k: usize| {
         let f = th0.ripple_f[k];
         let fade = dist_px * dist_px / (dist_px * dist_px + (crowd * f) * (crowd * f));
-        th0.ripple_a[k] * (tau * (f * ld + v.keyed.phase[k])).fsin() * fade
+        ((ld * f + v.keyed.phase[k]) * tau).fsin() * th0.ripple_a[k] * fade
     };
-    let (rl, ra, rb) = if escaped { (wave(0) + wave(1), wave(2), wave(3)) } else { (0., 0., 0.) };
+    let (rl, ra, rb) = pick(escaped, || (wave(0) + wave(1), wave(2), wave(3)), (zero, zero, zero));
     // The soft flame (every look): along the flame's contours at 2² times its own scale, a gentle lightness wave (2⁻⁴ either way, from its imaginary part) and a hue wave (¼ rad either way, from its real part), so its tongues read in the open field in the theme's own tones; it fades in away from the set by its contours' crowding, as the ripple's waves do.
-    let (flame_l, flame_h) = if escaped {
+    let (flame_l, flame_h) = pick(escaped, || {
         let fade = dist_px * dist_px / (dist_px * dist_px + (1 << 4) as f32);
-        ((tau * 4. * flame.1).fsin() * (1. / (1 << 4) as f32) * fade, (tau * 4. * flame.0).fsin() * 0.25 * fade)
-    } else {
-        (0., 0.)
-    };
-    let breathe = (tau * im).fcos() * (1. / (1 << 6) as f32) + rl + flame_l;
+        ((flame.1 * (tau * 4.)).fsin() * (1. / (1 << 4) as f32) * fade, (flame.0 * (tau * 4.)).fsin() * 0.25 * fade)
+    }, (zero, zero));
+    let breathe = (im * tau).fcos() * (1. / (1 << 6) as f32) + rl + flame_l;
     // Body: within about a pixel of the set, falling smoothly (C∞) to nothing a few pixels out.
-    let body = 1. / (1. + dist_px * dist_px);
+    let body = one / (dist_px * dist_px + 1.);
     // Rim: strongest about 2¹ pixels out, a smooth bump in log distance.
     let ll = (dist_px + 1. / (1 << 4) as f32).flog2() - 1.;
     let rim = (-(ll * ll)).fexp2();
@@ -1060,32 +1082,32 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
     // The key's turn of the lamps, applied with the view's own.
     let turn = (TAU as f32 * v.keyed.light_turn).fsin_cos();
     let lrot = (v.rot.0 * turn.1 - v.rot.1 * turn.0, v.rot.0 * turn.0 + v.rot.1 * turn.1);
-    let hyp = (sr * sr + dist_px * dist_px).sqrt();
-    let (sin_a, cos_a) = (sr / hyp, dist_px / hyp);
+    let hyp = (dist_px * dist_px + sr * sr).sqrt();
+    let (sin_a, cos_a) = (L::splat(sr) / hyp, dist_px / hyp);
     let julia = v.kind == Kind::Julia;
     let lit = |lamp: &Lamp| {
         let d = in_plane(lamp.dir, lrot);
-        let n_dot_l = if julia { sin_a * (o.ux * d.0 + o.uy * d.1) + cos_a * d.2 } else { d.2 };
-        lamp.strength * (n_dot_l - d.2)
+        let n_dot_l = if julia { sin_a * (o.ux * d.0 + o.uy * d.1) + cos_a * d.2 } else { L::splat(d.2) };
+        (n_dot_l - d.2) * lamp.strength
     };
     let (key, fill) = (lit(&lt.key), lit(&lt.fill));
     let shading = key + fill;
     // Tints: each lamp's on the faces it lights, the shadow's on the faces in shade, each at most 2⁻⁶ of chroma per unit lightness (4 · 2⁻⁶ for the key) and saturating smoothly as w/(w + 2⁻⁵).
-    let soft_w = |w: f32| w / (w + 1. / (1 << 5) as f32);
+    let soft_w = |w: L| w / (w + 1. / (1 << 5) as f32);
     let (kw, fw, sw) = (soft_w(positive_part(key)), soft_w(positive_part(fill)), soft_w(positive_part(-shading)));
-    let (k_t, f_t, s_t) = (0.02, 0.01, 0.01);
+    let (k_t, f_t, s_t) = (0.02f32, 0.01f32, 0.01f32);
     let tint = (
-        lt.key.tint.0 * kw * k_t + lt.fill.tint.0 * fw * f_t + lt.shadow.0 * sw * s_t + ra,
-        lt.key.tint.1 * kw * k_t + lt.fill.tint.1 * fw * f_t + lt.shadow.1 * sw * s_t + rb,
+        kw * lt.key.tint.0 * k_t + fw * lt.fill.tint.0 * f_t + sw * lt.shadow.0 * s_t + ra,
+        kw * lt.key.tint.1 * k_t + fw * lt.fill.tint.1 * f_t + sw * lt.shadow.1 * s_t + rb,
     );
     // Nacre: the hue turns with the surface's facing across the key lamp (the normal's horizontal part crossed with it), up to ¼ rad either way, the way mother-of-pearl shifts colour with angle; only where the surface tilts.
     let kd = in_plane(lt.key.dir, lrot);
     let kh = (kd.0 * kd.0 + kd.1 * kd.1).sqrt();
-    let nacre = if julia { 0.25 * sin_a * (o.ux * kd.1 - o.uy * kd.0) / kh } else { 0. };
-    let edge = rim * (1. - body);
+    let nacre = if julia { sin_a * 0.25 * (o.ux * kd.1 - o.uy * kd.0) / kh } else { zero };
+    let edge = rim * (one - body);
     // Lightness and saturation: the ground's, moving to the body's on the set and the edge's around it, settling back to the ground far out; the slope's shading on top, everywhere it tilts.
-    let lightness = th.ground_l + (th.body_l - th.ground_l) * body + (th.rim_l - th.ground_l) * edge * (1. - far) + shading + breathe;
-    let sat = th.ground_s + (th.body_s - th.ground_s) * body + (th.rim_s - th.ground_s) * edge * (1. - far);
+    let lightness = body * (th.body_l - th.ground_l) + th.ground_l + edge * (th.rim_l - th.ground_l) * (one - far) + shading + breathe;
+    let sat = body * (th.body_s - th.ground_s) + th.ground_s + edge * (th.rim_s - th.ground_s) * (one - far);
     // How the picture is made: soft colours (the avatars'), a medal, or enamel (see `Attest::style`).
     let style = look.style.of(v.attest.style);
     // The engraving (attest): hairlines `hair` pixels wide on the level lines of the potential and on the rays, both read where the orbit first passed 2⁸ (see `Orbit`), so each level's rays meet the next level's twice as many exactly on a level line. Enamel needs its wires, so a device with no engraving gets level lines there.
@@ -1094,40 +1116,38 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
     let engrave = if style == 2 && engrave == 0 { 1 } else { engrave };
     let pi = core::f32::consts::PI;
     let (m_lv, n_ray) = (v.attest.levels, v.attest.rays);
-    let lv_px = m_lv / (core::f32::consts::LN_2 * dist_px);
-    let ray_px = n_ray * o.ln_turn.fexp() * k / tau;
-    let apart = |per_px: f32| {
-        let s = 1. / per_px;
-        let crowd = 8. * hair;
+    let lv_px = L::splat(m_lv) / (dist_px * core::f32::consts::LN_2);
+    let ray_px = o.ln_turn.fexp() * n_ray * k / tau;
+    let apart = |per_px: L| {
+        let s = one / per_px;
+        let crowd = hair * 8.;
         s * s / (s * s + crowd * crowd)
     };
-    let ink = |x: f32, per_px: f32| {
-        let d = (pi * x).fsin() / (pi * per_px * hair);
+    let ink = |x: L, per_px: L| {
+        let d = (x * pi).fsin() / (per_px * pi * hair);
         (-(d * d)).fexp2() * apart(per_px)
     };
-    let line = if escaped {
-        let levels = if engrave & 1 == 1 { ink(o.lv * m_lv, lv_px) } else { 0. };
-        let rays = if engrave & 2 == 2 { ink(o.ray * n_ray, ray_px) } else { 0. };
-        1. - (1. - levels) * (1. - rays)
-    } else {
-        0.
-    };
+    let line = pick(escaped, || {
+        let levels = if engrave & 1 == 1 { ink(o.lv * m_lv, lv_px) } else { zero };
+        let rays = if engrave & 2 == 2 { ink(o.ray * n_ray, ray_px) } else { zero };
+        one - (one - levels) * (one - rays)
+    }, zero);
     // The surface for the attest styles, in screen terms: the relief's horizontal tilt brought back from the plane (the conjugate of the view's turn), and the key lamp turned by the key.
-    let (px, py) = if julia { (sin_a * o.ux, sin_a * o.uy) } else { (0., 0.) };
+    let (px, py) = if julia { (sin_a * o.ux, sin_a * o.uy) } else { (zero, zero) };
     let (rx, ry) = (px * v.rot.0 + py * v.rot.1, -px * v.rot.1 + py * v.rot.0);
     let l = { let d = lt.key.dir; (d.0 * turn.1 - d.1 * turn.0, d.0 * turn.0 + d.1 * turn.1, d.2) };
     let half = unit3((l.0, l.1, l.2 + 1.));
-    let facing = |n: (f32, f32, f32)| positive_part(n.0 * half.0 + n.1 * half.1 + n.2 * half.2);
+    let facing = |n: (L, L, L)| positive_part(n.0 * half.0 + n.1 * half.1 + n.2 * half.2);
     // How raised the set stands for the metal styles: 1 on it, falling smoothly (C∞) to nothing about 2 hairs out, a width in the picture's own terms, so a dense whorl still shows its field between the dust.
-    let raised = { let d = dist_px / (2. * hair); 1. / (1. + d * d) };
+    let raised = { let d = dist_px / (hair * 2.); one / (d * d + 1.) };
     let rgb = match style {
         0 => {
             // A line moves the lightness 2⁻³ the way the theme's edge goes from its ground (ink darker, glow lighter) and takes the edge's saturation.
             let way = if th.rim_l > th.ground_l { 1. } else { -1. };
-            let lightness = lightness + way * 0.125 * line;
-            let sat = sat + (th.rim_s - sat) * line;
+            let lightness = lightness + line * (way * 0.125);
+            let sat = sat + (L::splat(th.rim_s) - sat) * line;
             // Hue: the ground's base, drifting toward the far field, swung by the colouring, turned by the nacre, and turned by the theme's accent on the set.
-            let rgb = soft(th, lightness, sat, th.spread * swing + flame_h + th.drift * far + nacre + th.accent * body, tint);
+            let rgb = soft(th, lightness, sat, swing * th.spread + flame_h + far * th.drift + nacre + body * th.accent, tint);
             // The material (attest): a highlight of the key lamp on the ball, its normal the sphere's (`sphere`, screen x right, y down, z out) tilted by a quarter of the relief's slope, and for glass a Fresnel sheen toward the rim. Added as a screen blend, c + s·(1 − c), so it brightens without clipping.
             let material = look.material.of(v.attest.material);
             if material == 0 {
@@ -1136,75 +1156,79 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
                 let n = unit3((sphere.0 + rx * 0.25, sphere.1 + ry * 0.25, sphere.2));
                 let nh = facing(n);
                 let spec = match material {
-                    1 => 0.25 * nh.powi(1 << 3),
-                    2 => 0.125 * nh.powi(1 << 3) + 0.75 * nh.powi(1 << 6),
-                    _ => 0.875 * nh.powi(1 << 8) + 0.375 * (1. - n.2).powi(1 << 2),
+                    1 => nh.powi(1 << 3) * 0.25,
+                    2 => nh.powi(1 << 3) * 0.125 + nh.powi(1 << 6) * 0.75,
+                    _ => nh.powi(1 << 8) * 0.875 + (one - n.2).powi(1 << 2) * 0.375,
                 };
-                rgb.map(|c| c + spec * (1. - c))
+                rgb.map(|c| c + spec * (one - c))
             }
         }
         1 => {
             // A medal: the relief struck in metal on a faintly domed field (a quarter of the ball's curve), the set raised in `metal_a` and the field in `metal_b` (one metal or two), the engraving cut in as darker grooves.
-            let n = unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, 1.));
+            let n = unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, one));
             let (a, b) = (METALS[v.attest.metal_a as usize], METALS[v.attest.metal_b as usize]);
-            let base = [0, 1, 2].map(|i| b[i] + (a[i] - b[i]) * raised);
-            expose(metal(base, n, l).map(|c| c * (1. - 0.5 * line)))
+            let base = [0, 1, 2].map(|i| raised * (a[i] - b[i]) + b[i]);
+            expose(metal(base, n, l).map(|c| c * (one - line * 0.5)))
         }
         2 => {
             // Enamel (cloisonné): each cell between the engraving's lines filled with one of four colours around the theme's hue (richer than the avatars' but held under the same gamut cap), the set's dust and the wires in `metal_a`, under a faint glaze.
             // A cell's colour comes from a hash of its level and ray indices; where the cells crowd near the set (as their lines fade) the colours fade to the first of the four, the theme's own hue, so they never speckle.
-            let cl = (o.lv * m_lv).floor() as i32;
-            let cr = if engrave & 2 == 2 { (o.ray * n_ray).floor() as i32 } else { 0 };
-            let which = (jitter(cl as u32, cr as u32, v.attest.cells).0 * 4.) as usize;
+            let cl = (o.lv * m_lv).floor().to_i32();
+            let cr = if engrave & 2 == 2 { (o.ray * n_ray).floor().to_i32() } else { L::U::splat(0) };
+            // Which of the four, 0 to 3, as a whole float.
+            let which = (jitter::<L>(cl, cr, L::U::splat(v.attest.cells)).0 * 4.).floor();
             let lift = (th.ground_l - 0.67) * 0.5;
-            let pal = [(0.62, 0.), (0.52, tau / 3.), (0.72, -tau / 3.), (0.44, tau / 2.)].map(|(pl, dh)| soft(th, pl + lift, 0.15, dh, (0., 0.)).map(|c| c * c * 1.25));
-            let fade = if escaped { apart(lv_px) * if engrave & 2 == 2 { apart(ray_px) } else { 1. } } else { 0. };
-            let cell = [0, 1, 2].map(|i| pal[0][i] + (pal[which][i] - pal[0][i]) * fade);
-            let n = unit3((sphere.0 * 0.5 + rx, sphere.1 * 0.5 + ry, 1.));
-            let gold = metal(METALS[v.attest.metal_a as usize], n, l);
-            let w = 1. - (1. - raised) * (1. - line);
+            let pal = [(0.62, 0.), (0.52, tau / 3.), (0.72, -tau / 3.), (0.44, tau / 2.)].map(|(pl, dh)| soft::<f32>(th, pl + lift, 0.15, dh, (0., 0.)).map(|c| c * c * 1.25));
+            let chosen = (1..4).fold(pal[0].map(L::splat), |c, j| select(which.ge(L::splat(j as f32)), pal[j].map(L::splat), c));
+            let fade = pick(escaped, || apart(lv_px) * if engrave & 2 == 2 { apart(ray_px) } else { one }, zero);
+            let cell = [0, 1, 2].map(|i| (chosen[i] - pal[0][i]) * fade + pal[0][i]);
+            let n = unit3((sphere.0 * 0.5 + rx, sphere.1 * 0.5 + ry, one));
+            let gold = metal(METALS[v.attest.metal_a as usize].map(L::splat), n, l);
+            let w = one - (one - raised) * (one - line);
             let lin = [0, 1, 2].map(|i| cell[i] + (gold[i] - cell[i]) * w);
             // The glaze: a faint sheen of the key lamp on the relief's own slope (a quarter of the ball's curve under it), so it catches the set's walls instead of sitting on the ball like glass.
-            let spec = 0.125 * facing(unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, 1.))).powi(1 << 5);
-            expose(lin).map(|c| c + spec * (1. - c))
+            let spec = facing(unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, one))).powi(1 << 5) * 0.125;
+            expose(lin).map(|c| c + spec * (one - c))
         }
         _ => {
             // Lacquer: the avatars' own colouring, a step darker and twice as saturated (the gamut cap in `soft` still holds it), the engraving inked in, the set raised in `metal_a`, under the same glaze as enamel.
             let way = if th.rim_l > th.ground_l { 1. } else { -1. };
-            let lacquer = soft(th, lightness * 0.75 + way * 0.125 * line, sat * 2., th.spread * swing + flame_h + th.drift * far + nacre + th.accent * body, tint).map(|c| c * c * 1.25);
-            let n = unit3((sphere.0 * 0.5 + rx, sphere.1 * 0.5 + ry, 1.));
-            let gold = metal(METALS[v.attest.metal_a as usize], n, l);
+            let lacquer = soft(th, lightness * 0.75 + line * (way * 0.125), sat * 2., swing * th.spread + flame_h + far * th.drift + nacre + body * th.accent, tint).map(|c| c * c * 1.25);
+            let n = unit3((sphere.0 * 0.5 + rx, sphere.1 * 0.5 + ry, one));
+            let gold = metal(METALS[v.attest.metal_a as usize].map(L::splat), n, l);
             let lin = [0, 1, 2].map(|i| lacquer[i] + (gold[i] - lacquer[i]) * raised);
-            let spec = 0.125 * facing(unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, 1.))).powi(1 << 5);
-            expose(lin).map(|c| c + spec * (1. - c))
+            let spec = facing(unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, one))).powi(1 << 5) * 0.125;
+            expose(lin).map(|c| c + spec * (one - c))
         }
     };
     // The electric flame (attest): arcs where the flame's real or imaginary part, at the device's `arcs` times its own scale, crosses a whole number — the contours that curl off the set as tongues. Each arc is a core (2⁻⁴ of a contour wide) inside a halo (¼ of one wide, falling off as 1/(1 + x²)), and between them wisps: the same contours at 2² times the density, a thin core 2⁻⁵ wide in the arc's colour, a touch toward white, and no halo.
     // Chromatic: an arc along one part takes its colour from the other part, the hue swinging up to a third of a turn either side of the theme's as the arc runs, so one arc passes through neighbouring hues; its core is that colour run toward white, hot but not blank.
     // Added as light with a screen blend (on a ground dimmed by ⅜, a plasma globe's dark glass), so it brightens without clipping. Like the ripple, it fades in away from the set, where its contours would crowd into noise, and the wisps, four times denser, fade in further out.
-    let rgb = if look.electric > 0. && escaped {
-        let line = |x: f32, core_w: f32| {
-            let s = (pi * x).fsin();
-            let (c, h) = (s / core_w, s * 4.);
-            ((-(c * c)).fexp2(), 1. / (1. + h * h))
-        };
-        let gain = v.attest.arcs;
-        let (c0, h0) = line(flame.0 * gain, 1. / (1 << 4) as f32);
-        let (c1, h1) = line(flame.1 * gain, 1. / (1 << 4) as f32);
-        let (w0, _) = line(flame.0 * gain * 4., 1. / (1 << 5) as f32);
-        let (w1, _) = line(flame.1 * gain * 4., 1. / (1 << 5) as f32);
-        let hue = |other: f32| soft(th, 0.7, 0.2, (tau / 3.) * (tau * other * gain * 0.25).fsin(), (0., 0.));
-        let (k0, k1) = (hue(flame.1), hue(flame.0));
-        let d2 = dist_px * dist_px;
-        let fade = d2 / (d2 + (1 << 4) as f32) * look.electric;
-        let wisp_fade = d2 / (d2 + (1 << 6) as f32) * look.electric;
-        [0, 1, 2].map(|i| {
-            let arc = |k: [f32; 3], c: f32, h: f32| (k[i] * (h * 0.625 + c * 0.5) + c * 0.375) * fade;
-            let wisp = |k: [f32; 3], w: f32| (k[i] * 0.625 + 0.125) * w * wisp_fade;
-            let e = 1. - (1. - arc(k0, c0, h0)) * (1. - arc(k1, c1, h1)) * (1. - wisp(k0, w0)) * (1. - wisp(k1, w1));
-            let base = rgb[i] * (1. - 0.375 * look.electric);
-            base + e * (1. - base)
-        })
+    let rgb = if look.electric > 0. {
+        pick(escaped, || {
+            let line = |x: L, core_w: f32| {
+                let s = (x * pi).fsin();
+                let (c, h) = (s / core_w, s * 4.);
+                ((-(c * c)).fexp2(), one / (h * h + 1.))
+            };
+            let gain = v.attest.arcs;
+            let (c0, h0) = line(flame.0 * gain, 1. / (1 << 4) as f32);
+            let (c1, h1) = line(flame.1 * gain, 1. / (1 << 4) as f32);
+            let (w0, _) = line(flame.0 * gain * 4., 1. / (1 << 5) as f32);
+            let (w1, _) = line(flame.1 * gain * 4., 1. / (1 << 5) as f32);
+            let hue = |other: L| soft(th, L::splat(0.7), L::splat(0.2), (other * tau * gain * 0.25).fsin() * (tau / 3.), (zero, zero));
+            let (k0, k1) = (hue(flame.1), hue(flame.0));
+            let d2 = dist_px * dist_px;
+            let fade = d2 / (d2 + (1 << 4) as f32) * look.electric;
+            let wisp_fade = d2 / (d2 + (1 << 6) as f32) * look.electric;
+            [0, 1, 2].map(|i| {
+                let arc = |k: [L; 3], c: L, h: L| (k[i] * (h * 0.625 + c * 0.5) + c * 0.375) * fade;
+                let wisp = |k: [L; 3], w: L| (k[i] * 0.625 + 0.125) * w * wisp_fade;
+                let e = one - (one - arc(k0, c0, h0)) * (one - arc(k1, c1, h1)) * (one - wisp(k0, w0)) * (one - wisp(k1, w1));
+                let base = rgb[i] * (1. - 0.375 * look.electric);
+                base + e * (one - base)
+            })
+        }, rgb)
     } else {
         rgb
     };
@@ -1237,15 +1261,16 @@ pub const MAX_SAMPLES: usize = 1 << 6;
 
 /// A cheap integer hash (a 32-bit avalanche: xor-shift and multiply rounds, the constants are the mix's design) of a pixel and a sample index, as a point in the unit square.
 #[inline]
-fn jitter(px: u32, py: u32, m: u32) -> (f32, f32) {
-    let mut h = px.wrapping_mul(0x9E37_79B1) ^ py.wrapping_mul(0x85EB_CA77) ^ m.wrapping_mul(0xC2B2_AE3D);
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x7FEB_352D);
-    h ^= h >> 15;
-    h = h.wrapping_mul(0x846C_A68B);
-    h ^= h >> 16;
+fn jitter<L: Lane>(px: L::U, py: L::U, m: L::U) -> (L, L) {
+    let k = |c: u32| L::U::splat(c);
+    let mut h = px.wrapping_mul(k(0x9E37_79B1)) ^ py.wrapping_mul(k(0x85EB_CA77)) ^ m.wrapping_mul(k(0xC2B2_AE3D));
+    h = h ^ (h >> 16);
+    h = h.wrapping_mul(k(0x7FEB_352D));
+    h = h ^ (h >> 15);
+    h = h.wrapping_mul(k(0x846C_A68B));
+    h = h ^ (h >> 16);
     let scale = 1. / (1u32 << 16) as f32;
-    ((h & 0xFFFF) as f32 * scale, (h >> 16) as f32 * scale)
+    (L::from_u32(h & k(0xFFFF)) * scale, L::from_u32(h >> 16) * scale)
 }
 
 /// Render the mark spherized into a disc of radius `r` pixels centred at (`cx`, `cy`) in `buf` (rows of `w`, α + darkness); pixels outside the disc are left empty (α = 0), so it can go over any background.
@@ -1300,7 +1325,7 @@ pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, 
                 let mut sum = [0f32; 3];
                 let mut m = 0usize;
                 loop {
-                    let (jx, jy) = jitter(px as u32, py as u32, m as u32);
+                    let (jx, jy) = jitter::<f32>(px as u32, py as u32, m as u32);
                     let s = sample(px as f32 + jx - cx, py as f32 + jy - cy);
                     // The newest sample against the mean of the ones before it, in 8-bit display levels.
                     let spread = if m == 0 {
@@ -1405,7 +1430,7 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
                 let mut m = 0usize;
                 let (mut before, mut before_cover, mut pass_end) = ([0f32; 3], 0f32, 1usize);
                 loop {
-                    let (jx, jy) = jitter(px as u32, py as u32, m as u32);
+                    let (jx, jy) = jitter::<f32>(px as u32, py as u32, m as u32);
                     // Stratified: the m-th sample in cell (m mod k, m div k) of the k × k grid.
                     let (jx, jy) = if let Aa::Stratified(k) = look.aa { let (kf, mu) = (k as f32, m as u32); (((mu % k) as f32 + jx) / kf, ((mu / k) as f32 + jy) / kf) } else { (jx, jy) };
                     let (s, a) = sample(px as f32 + jx - cx, py as f32 + jy - cy);
@@ -1503,11 +1528,12 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
         line + (1. - line) * 0.5 * (positive_part(1. - u) - positive_part(-u))
     };
     // A component's cell from λ and its radius in pixels: λ as the ball's disc point (Im λ, Re λ), so in the main cardioid, where λ ≈ 2c near its centre, the ball stands as the screen does (right is +Im, down is +Re).
-    // WHY the bound on |p|: a point a rounding inside a rim would round to 1 (outside the ball) in Q15; held at 1 − 2⁻¹⁵ it is the rim's colour either way, and the i16 cannot wrap to −1.
+    // WHY the bound on |p|, as a length: λ within a rounding of a rim can come out at or past 1, outside the ball, where its √(1 − |p|²) is NaN (a white speck, about 20 to a 600 px mark when each coordinate was held on its own, 2026-10-29, since the diagonals still passed 1); scaled back to |p| = 1 − 2⁻¹⁵ it is the rim's colour either way, |p|² stays below 1, and neither i16 can reach ±2¹⁵.
     let comp = |lam: (f32, f32), r_pic: f32| -> FreshCell {
-        let top = q15 - 1.;
-        let qx = (lam.1 * q15).max(-top).min(top);
-        let qy = (lam.0 * q15).max(-top).min(top);
+        let top = 1. - 1. / q15;
+        let l2 = lam.0 * lam.0 + lam.1 * lam.1;
+        let s = if l2 > top * top { top / l2.sqrt() } else { 1. };
+        let (qx, qy) = (lam.1 * s * q15, lam.0 * s * q15);
         // WHY the floor on ρ: at the cardioid's cusp (c = ¼ exactly) the radius is 0 and log₂ 0 = −∞, which as an i16 would read as OUTSIDE; one above RIM is a radius of 2⁻¹²⁸, all rim.
         [qx as i16, qy as i16, (r_pic.flog2() * (1 << 8) as f32).max(RIM as f32 + 1.) as i16]
     };
@@ -1580,24 +1606,9 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
             Pt::Slow => [0, 0, RIM],
         }
     };
-    // A cell's colour (display gamma), coverage, and whether it is a component's: the ball at the disc point, at the component's scale.
-    let colour = |cl: FreshCell| -> ([f32; 3], f32, bool) {
-        match cl[2] {
-            OUTSIDE => (aura, cl[0] as f32 / q15, false),
-            RIM => (aura, 1., true),
-            rho => {
-                let p = (cl[0] as f32 / q15, cl[1] as f32 / q15);
-                let r_pic = (rho as f32 * (1. / (1 << 8) as f32)).fexp2();
-                let q2 = p.0 * p.0 + p.1 * p.1;
-                let g = rad / (1. - q2).sqrt();
-                let (a, b) = (p.0 * g, p.1 * g);
-                let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
-                let kk = rad / (r_pic * (1. - q2));
-                let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
-                let c = shade(x, y, &v, kk, &look, (p.0, p.1, (1. - q2).sqrt()), r_pic * (1. / (1 << 7) as f32)).0;
-                ([0, 1, 2].map(|i| aura[i] + (c[i] - aura[i]) * taper), 1., true)
-            }
-        }
+    // The colour (display gamma) and coverage of a cell that is not a component's: the glow outside, or the device's colour on a rim. A component's is the ball (`ball`), four samples at a time.
+    let plain = |cl: FreshCell| -> ([f32; 3], f32) {
+        if cl[2] == OUTSIDE { (aura, cl[0] as f32 / q15) } else { (aura, 1.) }
     };
     let (x0, x1) = ((cx - r - 1.) as usize, (cx + r + 2.) as usize);
     let (y0, y1) = ((cy - r - 1.) as usize, (cy + r + 2.) as usize);
@@ -1617,7 +1628,7 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
                 let centre_cell = cell(px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
                 if centre_cell[2] == OUTSIDE {
                     inside[i >> 6] &= !(1u64 << (i & 63));
-                    let (s, a, _) = colour(centre_cell);
+                    let (s, a) = plain(centre_cell);
                     buf[i] = pack(s, a);
                     continue;
                 }
@@ -1626,7 +1637,7 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
             let kk2 = (k * k) as usize;
             let mut any = false;
             for m in 0..kk2 {
-                let (jx, jy) = jitter(px as u32, py as u32, m as u32);
+                let (jx, jy) = jitter::<f32>(px as u32, py as u32, m as u32);
                 let (sx, sy) = (((m as u32 % k) as f32 + jx) / kf, ((m as u32 / k) as f32 + jy) / kf);
                 let fresh = || cell(px as f32 + sx - cx, py as f32 + sy - cy);
                 cells[m] = if full { fresh() } else if at + m < map.len() { map[at + m] } else { fresh() };
@@ -1648,10 +1659,32 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
             } else {
                 at += kk2;
             }
+            // The samples' colours and coverages in sample order, so they add up in the order they always did: the plain cells one by one, the components' gathered and shaded four at a time.
+            let mut cols = [([0f32; 3], 0f32); 1 << 6];
+            let mut comps = [0usize; 1 << 6];
+            let mut n_comps = 0;
+            for m in 0..kk2 {
+                if cells[m][2] == OUTSIDE || cells[m][2] == RIM {
+                    cols[m] = plain(cells[m]);
+                } else {
+                    comps[n_comps] = m;
+                    n_comps += 1;
+                }
+            }
+            for chunk in comps[..n_comps].chunks(4) {
+                // A short last chunk fills its spare lanes with its first sample (the same orbit, so it never runs longer), and their colours are dropped.
+                let mut at4 = [chunk[0]; 4];
+                at4[..chunk.len()].copy_from_slice(chunk);
+                let lane = |j: usize| F4(at4.map(|m| cells[m][j] as f32));
+                let c = ball((lane(0) * (1. / q15), lane(1) * (1. / q15)), lane(2), &v, rad, &look, aura);
+                for (j, &m) in chunk.iter().enumerate() {
+                    cols[m] = ([c[0].0[j], c[1].0[j], c[2].0[j]], 1.);
+                }
+            }
             let mut sum = [0f32; 3];
             let mut cover = 0f32;
             for m in 0..kk2 {
-                let (s, a, _) = colour(cells[m]);
+                let (s, a) = cols[m];
                 for i in 0..3 {
                     sum[i] += s[i] * s[i] * a;
                 }
@@ -1661,6 +1694,22 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
             buf[i] = pack(rgb, cover / kk2 as f32);
         }
     }
+}
+
+/// The fresh mark's ball in a component (`render_fresh`): the attest ball's colour (display gamma) at disc point p, at the component's scale (`rho`, log₂ of its radius in pixels, Q8), tapering into `aura` at the rim by the look's vignette; one sample or four (`Lane`).
+#[inline]
+fn ball<L: Lane>(p: (L, L), rho: L, v: &View, rad: f32, look: &Look, aura: [f32; 3]) -> [L; 3] {
+    let one = L::splat(1.);
+    let r_pic = (rho * (1. / (1 << 8) as f32)).fexp2();
+    let q2 = p.0 * p.0 + p.1 * p.1;
+    // WHY the rounded root here alone: the sample's plane point starts an orbit that, near the set, magnifies an ulp of it into a different escape (measured: one sample in 2¹² moved by up to 42 levels with `sqrt1` here); every other root's ulp only moves a colour by as much.
+    let g = L::splat(rad) / (one - q2).sqrt_rounded();
+    let (a, b) = (p.0 * g, p.1 * g);
+    let (x, y) = (a * v.rot.0 + v.centre.0 - b * v.rot.1, a * v.rot.1 + v.centre.1 + b * v.rot.0);
+    let kk = L::splat(rad) / (r_pic * (one - q2));
+    let taper = (one - q2.powi(look.vignette / 2)).sqrt();
+    let c = shade(x, y, v, kk, look, (p.0, p.1, (one - q2).sqrt()), r_pic * (1. / (1 << 7) as f32)).0;
+    [0, 1, 2].map(|i| (c[i] - aura[i]) * taper + aura[i])
 }
 
 /// Where this picture came from in the Mandelbrot set: the Julia set's c.
