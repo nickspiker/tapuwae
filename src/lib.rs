@@ -23,8 +23,42 @@
 //! The colouring method is one of four: smooth iteration bands, a swirl of the potential's gradient direction, an orbit trap (distance to a hash-chosen point: rings and petals), or the flame (mandelbrot-exploder's weighted orbit means); every method also carries soft contours of the real distance estimate.
 //! Nothing compares the text against anything, so the picture says nothing about whether the text is right.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloc::{vec, vec::Vec};
+use core::f64::consts::TAU;
+#[cfg(feature = "std")]
 use rayon::prelude::*;
-use std::f64::consts::TAU;
+
+#[cfg(not(feature = "std"))]
+mod nostd;
+#[cfg(not(feature = "std"))]
+use nostd::{F32Math, F64Math};
+
+/// The rows of `buf` (`w` wide) with their indices: across the cores with std (rayon), one after another without.
+macro_rules! rows {
+    ($buf:expr, $w:expr) => {{
+        #[cfg(feature = "std")]
+        let it = $buf.par_chunks_mut($w).enumerate();
+        #[cfg(not(feature = "std"))]
+        let it = $buf.chunks_mut($w).enumerate();
+        it
+    }};
+}
+
+/// The rows' sample histograms added together (`rows!` mapped to one histogram a row), from `zero`.
+macro_rules! add_rows {
+    ($hists:expr, $zero:expr) => {{
+        let add = |a: Vec<u64>, b: Vec<u64>| -> Vec<u64> { a.iter().zip(&b).map(|(x, y)| x + y).collect() };
+        #[cfg(feature = "std")]
+        let total = $hists.reduce(|| $zero, add);
+        #[cfg(not(feature = "std"))]
+        let total = $hists.fold($zero, add);
+        total
+    }};
+}
 
 /// Iteration cap for the render: deep enough for the windows used here.
 const MAX_ITER: u32 = 1 << 10;
@@ -172,7 +206,7 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
             engraved = true;
             lv = n as f32 + 1. - (r2.ln() / ENGRAVE_SQ.ln()).log2();
             ray = z.1.atan2(z.0) * (1. / TAU as f32);
-            ln_turn = dm.ln() + dm_exp as f32 * std::f32::consts::LN_2 - 0.5 * r2.ln();
+            ln_turn = dm.ln() + dm_exp as f32 * core::f32::consts::LN_2 - 0.5 * r2.ln();
         }
         let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
         trap_sq = trap_sq.min(tx * tx + ty * ty);
@@ -507,7 +541,7 @@ impl Keyed {
     fn new(salt: &[u8; 32], text: &str, progressive: bool) -> Self {
         let pick = |domain: u8, wraps: bool, rate: f64| (if progressive { walk_at(salt, domain, text, 0, wraps, rate) } else { unit(&draw(salt, domain, 0, text.as_bytes())[0..4]) }) as f32;
         let slow = 0.75;
-        let mid = std::f64::consts::FRAC_1_SQRT_2;
+        let mid = core::f64::consts::FRAC_1_SQRT_2;
         let fast = 0.25;
         Keyed {
             phase: [pick(32, true, slow), pick(33, true, slow), pick(34, true, slow), pick(35, true, slow)],
@@ -758,7 +792,7 @@ impl Lighting {
 
     /// The one fixed lighting, for comparison with the per-device kind: a key lamp from the top left at 45° up, no tint, no fill, relief 2¹ px.
     fn fixed() -> Self {
-        let e = std::f32::consts::FRAC_1_SQRT_2;
+        let e = core::f32::consts::FRAC_1_SQRT_2;
         let none = Lamp { dir: (0., 0., 1.), strength: 0., tint: (0., 0.) };
         Lighting { key: Lamp { dir: (-0.5, -0.5, e), strength: 0.08, tint: (0., 0.) }, fill: none, shadow: (0., 0.), relief: 2. }
     }
@@ -991,7 +1025,7 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
     let dist_px = dist / k;
     // Distance contours: the theme's ripple, four waves across log₂ of the distance from the set, the field's own topography, their phases nudged by the key.
     // Near the set a wave of f turns per doubling has f/(d·ln 2) contours per pixel at d pixels out and would alias into hatching, so it fades in as d²/(d² + (4f/ln 2)²): gone within a few pixels of the set, full once its contours are over 4 pixels apart.
-    let crowd = 4. / std::f32::consts::LN_2;
+    let crowd = 4. / core::f32::consts::LN_2;
     // The faster a wave, the more closely its contours crowd near the set, so each fades in by its own frequency: d²/(d² + (crowd·f)²).
     let ld = dist.log2();
     let th0 = &v.theme;
@@ -1056,9 +1090,9 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
     // A line's distance in pixels is its coordinate's distance to the nearest whole number over the coordinate's change per pixel, with |sin(πx)|/π standing in for that distance (C∞, and the same near a line); each family fades in as its lines get more than 2³ hairs apart (`apart`), so they never crowd into hatching near the set.
     let engrave = look.engrave.of(v.attest.engrave);
     let engrave = if style == 2 && engrave == 0 { 1 } else { engrave };
-    let pi = std::f32::consts::PI;
+    let pi = core::f32::consts::PI;
     let (m_lv, n_ray) = (v.attest.levels, v.attest.rays);
-    let lv_px = m_lv / (std::f32::consts::LN_2 * dist_px);
+    let lv_px = m_lv / (core::f32::consts::LN_2 * dist_px);
     let ray_px = n_ray * o.ln_turn.exp() * k / tau;
     let apart = |per_px: f32| {
         let s = 1. / per_px;
@@ -1188,7 +1222,7 @@ fn pack(rgb: [f32; 3], alpha: f32) -> u32 {
 pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     let k = scale(p.half, w, h);
     let v = p.view();
-    buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
+    rows!(buf, w).for_each(|(py, row)| {
         for px in 0..w {
             let (x, y) = plane(&v, px, py, w, h, k);
             row[px] = pack(shade(x, y, &v, k, &Look::default(), (0., 0., 1.), 1.).0, 1.);
@@ -1249,8 +1283,7 @@ pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, 
         let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
         shade(x, y, &v, k, look, (qx, qy, (1. - q2).sqrt()), hair).0.map(|c| c * taper)
     };
-    buf.par_chunks_mut(w)
-        .enumerate()
+    let hists = rows!(buf, w)
         .map(|(py, row)| {
             let mut hist = vec![0u64; MAX_SAMPLES + 1];
             for px in 0..w {
@@ -1289,7 +1322,8 @@ pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, 
             }
             hist
         })
-        .reduce(|| vec![0u64; MAX_SAMPLES + 1], |a, b| a.iter().zip(&b).map(|(x, y)| x + y).collect())
+        ;
+    add_rows!(hists, vec![0u64; MAX_SAMPLES + 1])
 }
 
 /// How far the button's glow reaches past the ball's edge, as a fraction of its radius: 1/12, as ferros's circles glow (payloads/display, `GLOW_FRACTION`, owner 2026-10-24); and its fade, 2^GLOW_OCTAVES_LOG2 octaves of squared distance from full light to none (four, as `GLOW_OCT_LOG2`).
@@ -1351,8 +1385,7 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
         Aa::Fixed(n) => n as usize,
         Aa::Stratified(k) => (k * k) as usize,
     };
-    buf.par_chunks_mut(w)
-        .enumerate()
+    let hists = rows!(buf, w)
         .map(|(py, row)| {
             let mut hist = vec![0u64; cap + 1];
             for px in 0..w {
@@ -1420,7 +1453,8 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
             }
             hist
         })
-        .reduce(|| vec![0u64; cap + 1], |a, b| a.iter().zip(&b).map(|(x, y)| x + y).collect())
+        ;
+    add_rows!(hists, vec![0u64; cap + 1])
 }
 
 /// The view as the look shows it: mirrored (attest) is the conjugate picture, J(c̄) about the eye's conjugate turned the other way, which is the plain one flipped top to bottom with its whorl turning the other way; the lamps stay where they are.
@@ -1431,6 +1465,91 @@ fn mirrored(mut v: View, look: &Look) -> View {
         v.rot.1 = -v.rot.1;
     }
     v
+}
+
+/// The fresh mark (attest, a device no identity has attested on yet): the Mandelbrot set itself, antenna up, filling a disc of radius `r` pixels centred at (`cx`, `cy`), in the device's colour from `salt` (the device's own, from its ira).
+/// Inside, each hyperbolic component glows toward its rim: a point's shade is the attracting cycle's contraction per step, u = |λ|^(1/p) (0 at the component's centre, 1 on its edge), lightness 0.12 + 0.6·u⁴ in the device's colour, so the rim meets the glow outside at the same colour. The main cardioid and the period-2 disc have it in closed form (λ = 1 − √(1 − 4c) and 4(c + 1)); every other point iterates 2⁹ steps to settle, then averages ln|2z| over 2⁶ more (the Lyapunov exponent, ln u).
+/// Outside is black, with a glow from the distance estimate shaped as ferros's circles glow (`render_button`): full at the set, down by the same step every octave of distance, gone 1/GLOW_FRACTION of `r` out.
+/// Sampling: a `k` × `k` stratified grid per pixel, averaged in linear light with coverage (the glow is light over the background, coverage its brightness).
+pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], k: u32) {
+    let th = Theme::from_bytes(&draw(salt, 1, 0, &[]));
+    let aura = soft(&th, 0.72, 0.15, 0., (0., 0.));
+    // The set from Re −2 to 0.4713 and Im ±1.1225, centred on Re −0.764: half its length plus the glow's reach fills the disc.
+    let centre = -0.764f32;
+    let scale = 1.2357 * (1. + 1. / GLOW_FRACTION) / r;
+    let reach = r / GLOW_FRACTION;
+    let octaves = (1 << GLOW_OCTAVES_LOG2) as f32;
+    // One sample at (dx, dy) pixels from the centre: its colour (display gamma) and coverage. Up the screen is toward Re −2 (the antenna), right is +Im.
+    let sample = |dx: f32, dy: f32| -> ([f32; 3], f32) {
+        let c = (centre + dy * scale, dx * scale);
+        let inside = |u: f32| -> ([f32; 3], f32) {
+            let u4 = (u * u) * (u * u);
+            (soft(&th, 0.12 + 0.6 * u4, 0.15, 0., (0., 0.)), 1.)
+        };
+        // The main cardioid and the period-2 disc, in closed form.
+        let (xq, y2) = (c.0 - 0.25, c.1 * c.1);
+        let q = xq * xq + y2;
+        if q * (q + xq) < 0.25 * y2 {
+            // λ = 1 − √(1 − 4c): the principal square root of (1 − 4c), by halves.
+            let (ax, ay) = (1. - 4. * c.0, -4. * c.1);
+            let m = (ax * ax + ay * ay).sqrt();
+            let (sx, sy) = (((m + ax) * 0.5).sqrt(), ((m - ax) * 0.5).sqrt());
+            let sy = if ay < 0. { -sy } else { sy };
+            let (lx, ly) = (1. - sx, -sy);
+            return inside((lx * lx + ly * ly).sqrt());
+        }
+        if (c.0 + 1.) * (c.0 + 1.) + y2 < 1. / 16. {
+            let (lx, ly) = (4. * (c.0 + 1.), 4. * c.1);
+            return inside((lx * lx + ly * ly).sqrt().sqrt());
+        }
+        // Everything else iterates: z from 0, its derivative's magnitude (rescaled by 2⁻⁶⁴ past 2⁶⁴, as `orbit`), and after 2⁹ steps the sum of ln|2z|.
+        let (mut z, mut dm, mut plus, mut dm_exp, mut lyap) = ((0f32, 0f32), 0f32, 1f32, 0i32, 0f32);
+        let settle = 1u32 << 9;
+        for n in 0..settle + (1 << 6) {
+            let r2 = z.0 * z.0 + z.1 * z.1;
+            if r2 > BAIL_SQ_F32 {
+                let rz = r2.sqrt();
+                let d = rz * rz.ln() / dm * (-(dm_exp as f32)).exp2() / scale;
+                // WHY the floor of 2⁻⁸ of the reach: d is exactly 0 where the derivative overflowed (on the set), and log₂ 0 is −∞; the floor holds the glow at full there, 2⁴ times inside where it is already full.
+                let u = 1. + ((d + reach * (1. / (1 << 8) as f32)) / reach).log2() / octaves;
+                // The set's own line (its filaments and edge, within about a pixel) at full light, the halo around it at half, so the outline stays crisp inside its glow.
+                let line = (-(d * d)).exp2();
+                return (aura, line + (1. - line) * 0.5 * (positive_part(1. - u) - positive_part(-u)));
+            }
+            if n >= settle {
+                lyap += (4. * r2).ln() * 0.5;
+            }
+            dm = 2. * r2.sqrt() * dm + plus;
+            if dm > (1u64 << 63) as f32 * 2. {
+                let s = 1. / ((1u64 << 63) as f32 * 2.);
+                dm *= s;
+                plus *= s;
+                dm_exp += 64;
+            }
+            z = (z.0 * z.0 - z.1 * z.1 + c.0, 2. * z.0 * z.1 + c.1);
+        }
+        inside((lyap * (1. / (1 << 6) as f32)).exp())
+    };
+    let (x0, x1) = ((cx - r - 1.) as usize, (cx + r + 2.) as usize);
+    let (y0, y1) = ((cy - r - 1.) as usize, (cy + r + 2.) as usize);
+    let kf = k as f32;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let mut sum = [0f32; 3];
+            let mut cover = 0f32;
+            for m in 0..k * k {
+                let (jx, jy) = jitter(px as u32, py as u32, m);
+                let (sx, sy) = (((m % k) as f32 + jx) / kf, ((m / k) as f32 + jy) / kf);
+                let (s, a) = sample(px as f32 + sx - cx, py as f32 + sy - cy);
+                for i in 0..3 {
+                    sum[i] += s[i] * s[i] * a;
+                }
+                cover += a;
+            }
+            let rgb = if cover > 0. { sum.map(|c| (c / cover).sqrt()) } else { [0.; 3] };
+            buf[py * w + px] = pack(rgb, cover / (k * k) as f32);
+        }
+    }
 }
 
 /// Where this picture came from in the Mandelbrot set: the Julia set's c.
