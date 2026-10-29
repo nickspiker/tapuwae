@@ -945,17 +945,19 @@ const METALS: [[f32; 3]; 8] = [
 
 /// A studio around the picture, as a metal sees it: the brightness reflected along `rr` (a unit vector, screen x right, y down, z out), a bright sky above falling smoothly to a dim floor below, and a faint soft-box at the key lamp `l`.
 #[inline]
-fn studio<L: Lane>(rr: (L, L, L), l: (f32, f32, f32)) -> L {
-    let sky = L::splat(0.5) - (rr.1 * 3.).ftanh() * 0.5;
+fn studio<L: Lane>(rr: (L, L, L), l: (L, L, L), frame: (L, L)) -> L {
+    // The sky is above on the glass: the reflection's height on the screen, brought back from the picture's frame (`shade`'s `frame`).
+    let up = rr.1 * frame.0 - rr.0 * frame.1;
+    let sky = L::splat(0.5) - (up * 3.).ftanh() * 0.5;
     let lamp = positive_part(rr.0 * l.0 + rr.1 * l.1 + rr.2 * l.2).powi(1 << 5);
     sky * 0.5 + 0.0625 + lamp * 0.375
 }
 
 /// A metal of colour `base` (linear) with unit normal `n`, lit by the studio: the view straight down the z axis reflected about n, tinted by the metal, in linear light.
 #[inline]
-fn metal<L: Lane>(base: [L; 3], n: (L, L, L), l: (f32, f32, f32)) -> [L; 3] {
+fn metal<L: Lane>(base: [L; 3], n: (L, L, L), l: (L, L, L), frame: (L, L)) -> [L; 3] {
     let rr = (n.2 * 2. * n.0, n.2 * 2. * n.1, n.2 * 2. * n.2 - 1.);
-    let e = studio(rr, l);
+    let e = studio(rr, l, frame);
     base.map(|b| b * e)
 }
 
@@ -1017,8 +1019,8 @@ impl Look {
 
 /// A lamp's direction in the plane: its horizontal part turned by the view's `rot` (plane = centre + rot·screen), its height unchanged.
 #[inline]
-fn in_plane(d: (f32, f32, f32), rot: (f32, f32)) -> (f32, f32, f32) {
-    (d.0 * rot.0 - d.1 * rot.1, d.0 * rot.1 + d.1 * rot.0, d.2)
+fn in_plane<L: Lane>(d: (f32, f32, f32), rot: (L, L)) -> (L, L, L) {
+    (rot.0 * d.0 - rot.1 * d.1, rot.1 * d.0 + rot.0 * d.1, L::splat(d.2))
 }
 /// One point of the plane as a visible colour in [0, 1]; `k` is plane units per pixel; `sphere` is the ball's unit normal under it (screen x right, y down, z out; (0, 0, 1) for a flat picture), and `hair` the engraving's line width in pixels.
 /// One point of the plane as a visible colour in [0, 1]; `k` is plane units per pixel; `lp` is the light's direction in the plane.
@@ -1029,7 +1031,7 @@ fn in_plane(d: (f32, f32, f32), rot: (f32, f32)) -> (f32, f32, f32) {
 /// Each lamp's Lambert n·l, taken relative to a flat surface (which sees l_z), moves the lightness by strength·(n·l − l_z): faces turned to it rise, faces turned away fall, the flat field far out is untouched, and nothing is clipped. The faces a lamp lights take its tint, and the faces left in shade take the shadow tint, each split off smoothly (`positive_part`).
 /// Written once for one sample or four (`Lane`): every choice that depends on the sample is a `pick` or `select`, so four lanes take the same path; the look's and the view's choices are the same for every lane and stay `if`s.
 #[inline]
-fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), hair: L) -> ([L; 3], L) {
+fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), hair: L, frame: (L, L)) -> ([L; 3], L) {
     let (zero, one) = (L::splat(0.), L::splat(1.));
     let o = orbit(x, y, v);
     let r = (o.x * o.x + o.y * o.y).sqrt();
@@ -1088,13 +1090,15 @@ fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), ha
     let sr = lt.relief * look.relief * v.keyed.relief;
     // The key's turn of the lamps, applied with the view's own.
     let turn = (TAU as f32 * v.keyed.light_turn).fsin_cos();
-    let lrot = (v.rot.0 * turn.1 - v.rot.1 * turn.0, v.rot.0 * turn.0 + v.rot.1 * turn.1);
+    // The lamps are placed on the glass (top left); `frame` turns a direction on the glass into this picture's own (the identity for a picture drawn upright; a component's ball in the fresh mark stands as λ puts it, turned against the glass by arg λ′, and its lamps turn with that so they still shine from the top left of the screen).
+    let tf = (frame.0 * turn.1 - frame.1 * turn.0, frame.1 * turn.1 + frame.0 * turn.0);
+    let lrot = (tf.0 * v.rot.0 - tf.1 * v.rot.1, tf.1 * v.rot.0 + tf.0 * v.rot.1);
     let hyp = (dist_px * dist_px + sr * sr).sqrt();
     let (sin_a, cos_a) = (L::splat(sr) / hyp, dist_px / hyp);
     let julia = v.kind == Kind::Julia;
     let lit = |lamp: &Lamp| {
         let d = in_plane(lamp.dir, lrot);
-        let n_dot_l = if julia { sin_a * (o.ux * d.0 + o.uy * d.1) + cos_a * d.2 } else { L::splat(d.2) };
+        let n_dot_l = if julia { sin_a * (o.ux * d.0 + o.uy * d.1) + cos_a * d.2 } else { d.2 };
         (n_dot_l - d.2) * lamp.strength
     };
     let (key, fill) = (lit(&lt.key), lit(&lt.fill));
@@ -1142,7 +1146,7 @@ fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), ha
     // The surface for the attest styles, in screen terms: the relief's horizontal tilt brought back from the plane (the conjugate of the view's turn), and the key lamp turned by the key.
     let (px, py) = if julia { (sin_a * o.ux, sin_a * o.uy) } else { (zero, zero) };
     let (rx, ry) = (px * v.rot.0 + py * v.rot.1, -px * v.rot.1 + py * v.rot.0);
-    let l = { let d = lt.key.dir; (d.0 * turn.1 - d.1 * turn.0, d.0 * turn.0 + d.1 * turn.1, d.2) };
+    let l = { let d = lt.key.dir; (tf.0 * d.0 - tf.1 * d.1, tf.1 * d.0 + tf.0 * d.1, L::splat(d.2)) };
     let half = unit3((l.0, l.1, l.2 + 1.));
     let facing = |n: (L, L, L)| positive_part(n.0 * half.0 + n.1 * half.1 + n.2 * half.2);
     // How raised the set stands for the metal styles: 1 on it, falling smoothly (C∞) to nothing about 2 hairs out, a width in the picture's own terms, so a dense whorl still shows its field between the dust.
@@ -1175,7 +1179,7 @@ fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), ha
             let n = unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, one));
             let (a, b) = (METALS[v.attest.metal_a as usize], METALS[v.attest.metal_b as usize]);
             let base = [0, 1, 2].map(|i| raised * (a[i] - b[i]) + b[i]);
-            expose(metal(base, n, l).map(|c| c * (one - line * 0.5)))
+            expose(metal(base, n, l, frame).map(|c| c * (one - line * 0.5)))
         }
         2 => {
             // Enamel (cloisonné): each cell between the engraving's lines filled with one of four colours around the theme's hue (richer than the avatars' but held under the same gamut cap), the set's dust and the wires in `metal_a`, under a faint glaze.
@@ -1190,7 +1194,7 @@ fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), ha
             let fade = pick(escaped, || apart(lv_px) * if engrave & 2 == 2 { apart(ray_px) } else { one }, zero);
             let cell = [0, 1, 2].map(|i| (chosen[i] - pal[0][i]) * fade + pal[0][i]);
             let n = unit3((sphere.0 * 0.5 + rx, sphere.1 * 0.5 + ry, one));
-            let gold = metal(METALS[v.attest.metal_a as usize].map(L::splat), n, l);
+            let gold = metal(METALS[v.attest.metal_a as usize].map(L::splat), n, l, frame);
             let w = one - (one - raised) * (one - line);
             let lin = [0, 1, 2].map(|i| cell[i] + (gold[i] - cell[i]) * w);
             // The glaze: a faint sheen of the key lamp on the relief's own slope (a quarter of the ball's curve under it), so it catches the set's walls instead of sitting on the ball like glass.
@@ -1202,7 +1206,7 @@ fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), ha
             let way = if th.rim_l > th.ground_l { 1. } else { -1. };
             let lacquer = soft(th, lightness * 0.75 + line * (way * 0.125), sat * 2., swing * th.spread + flame_h + far * th.drift + nacre + body * th.accent, tint).map(|c| c * c * 1.25);
             let n = unit3((sphere.0 * 0.5 + rx, sphere.1 * 0.5 + ry, one));
-            let gold = metal(METALS[v.attest.metal_a as usize].map(L::splat), n, l);
+            let gold = metal(METALS[v.attest.metal_a as usize].map(L::splat), n, l, frame);
             let lin = [0, 1, 2].map(|i| lacquer[i] + (gold[i] - lacquer[i]) * raised);
             let spec = facing(unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, one))).powi(1 << 5) * 0.125;
             expose(lin).map(|c| c + spec * (one - c))
@@ -1271,7 +1275,7 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     rows!(buf, w).for_each(|(py, row)| {
         for px in 0..w {
             let (x, y) = plane(&v, px, py, w, h, k);
-            row[px] = pack(shade(x, y, &v, k, &Look::default(), (0., 0., 1.), 1.).0, 1.);
+            row[px] = pack(shade(x, y, &v, k, &Look::default(), (0., 0., 1.), 1., (1., 0.)).0, 1.);
         }
     });
 }
@@ -1328,7 +1332,7 @@ pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, 
         let k = rad / (r * (1. - q2));
         // |p|^k as (|p|²)^(k/2): k is even in every use, so it stays a whole power.
         let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
-        shade(x, y, &v, k, look, (qx, qy, (1. - q2).sqrt()), hair).0.map(|c| c * taper)
+        shade(x, y, &v, k, look, (qx, qy, (1. - q2).sqrt()), hair, (1., 0.)).0.map(|c| c * taper)
     };
     let hists = rows!(buf, w)
         .map(|(py, row)| {
@@ -1419,7 +1423,7 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
         let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
         let k = rad / (r_pic * (1. - q2));
         let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
-        let c = shade(x, y, &v, k, look, (qx, qy, (1. - q2).sqrt()), hair).0;
+        let c = shade(x, y, &v, k, look, (qx, qy, (1. - q2).sqrt()), hair, (1., 0.)).0;
         ([0, 1, 2].map(|i| aura[i] + (c[i] - aura[i]) * taper), 1.)
     };
     let e_out = r * BALL;
@@ -1514,21 +1518,23 @@ fn mirrored(mut v: View, look: &Look) -> View {
     v
 }
 
-/// One sample of the fresh mark's map, what its point is in the parameter plane (never the text), in 16-bit words, so a new handle redraws without iterating the set: a component's point as [x, y, ρ] with the ball's disc point (x, y) in Q15 (|p| < 1, 2⁻¹⁵ resolution) and ρ = log₂ of the component's radius in pixels, Q8 (0.27% steps); the set's glow outside as [light Q15, 0, OUTSIDE]; the device's colour (a rim, or no cycle found) as [0, 0, RIM].
-pub type FreshCell = [i16; 3];
+/// One sample of the fresh mark's map, what its point is in the parameter plane (never the text), in 16-bit words, so a new handle redraws without iterating the set: a component's point as [x, y, ρ, θ] with the ball's disc point (x, y) in Q15 (|p| < 1, 2⁻¹⁵ resolution), ρ = log₂ of the component's radius in pixels, Q8 (0.27% steps), and θ = arg λ′, the component's turn against the glass, as a 16-bit binary angle (a full turn is 2¹⁶, so it wraps as an angle does); the set's glow outside as [light Q15, 0, OUTSIDE, 0]; the device's colour (a rim, or no cycle found) as [0, 0, RIM, 0].
+pub type FreshCell = [i16; 4];
 const OUTSIDE: i16 = i16::MIN;
 const RIM: i16 = i16::MIN + 1;
+/// A fine cell not worked out yet: the full pass sets them, the first fine pass to reach one works it out.
+const UNSET: i16 = i16::MIN + 2;
 
 /// The fresh mark (attest, a device no identity has attested on yet): the Mandelbrot set itself, antenna up, filling a disc of radius `r` pixels centred at (`cx`, `cy`), in the device's colour, with the device's attest ball inside every hyperbolic component; everything from `salt` (the device's own, from its ira), and the ball also from `text`, the textbox, as the attest ball follows it (each character nudging it, `Params::new`).
 /// Outside is black, with a glow from the distance estimate shaped as ferros's circles glow (`render_button`): the set's line at full light, a halo at half, down by the same step every octave of distance, gone 1/GLOW_FRACTION of `r` out. It never depends on the text.
 /// Inside, a component is a disc to its multiplier λ (the attracting cycle's (fᵖ)′, a conformal map of the component onto the unit disc, 0 at its centre and of size 1 on its rim): the main cardioid and the period-2 disc have it in closed form (1 − √(1 − 4c) and 4(c + 1)); every other point iterates 2⁹ steps to settle, then finds its cycle (the first return within 2⁻²⁰) and multiplies 2z around it.
 /// The disc is the attest ball's disc, point for point: the same view, `shade` and `Look::attest()` (style, material, engraving, mirror, electric flame), tapering into the device's colour at the rim by √(1 − |p|²) rather than the button's twelfth power, which is the colour of the set's line outside, so every component blends into the outline. The ball's scale in pixels is the component's: its radius is 1/|dλ/dpixel| (in closed form for the cardioid and the period-2 disc, |λ′| = 2/|√(1 − 4c)| and 4; elsewhere λ again half a pixel along and the difference), and its lines are 2⁻⁷ of that, as the ball's are of its own.
 /// Where no cycle is found within 2⁶ steps (right at a rim, converging slowly, or a period past 2⁶) the device's colour stands, as the ball's rim does.
-/// `inside` is a bitmask of the pixels (one bit per pixel of `buf`, 64 a word, row after row) that hold any of a component, and `map` the masked pixels' samples (`FreshCell`, in pixel order, k² a pixel): with `full` every pixel renders and both are written; without, only the masked pixels render, from the map, so a new `text` costs the balls' shading alone and leaves the outline as it was. A map too short for every masked sample holds the first ones; the rest are worked out again each time. The full render draws from the cells as stored, so the first keystroke moves nothing but the ball.
+/// `inside` is a bitmask of the pixels (one bit per pixel of `buf`, 64 a word, row after row) whose centre falls in a component, and two maps of them, independent: `coarse`, one cell a pixel (its centre), worked out by the full pass; `fine`, k² cells a pixel, set to UNSET by the full pass and worked out by the first fine pass to reach each (so a fine pass stopped part way keeps what it did). With `full` every pixel renders, the mask and the coarse map are written and the fine map reset; without, only the masked pixels render, from the maps, so a new `text` costs the balls' shading alone and leaves the outline as it was. A map too short holds the first pixels' cells; the rest are worked out again each time.
 /// Sampling: one sample at a pixel's centre outside the components; a `k` × `k` stratified grid per pixel that touches one, averaged in linear light with coverage (the glow is light over the background, coverage its brightness), the grid's cells kept in the map.
 /// The pixels are ferros's 16-bit surface pixels (`pack16`): the mark goes to a 16-bit pipeline, so it keeps 14 bits a channel through to the display's dither (owner, 2026-10-29), not a fluor pixel's 8.
-/// Two passes for latency (owner, 2026-10-29): a coarse one (`fine` false) draws each component pixel from the one cell nearest its centre, four pixels to a lane call, to be on the glass at once; a fine one draws all k² cells to clear it up a moment later. `stop` is asked before every row: true leaves the pass where it is and returns false (a newer handle is waiting); a finished pass returns true.
-pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], text: &str, k: u32, inside: &mut [u64], map: &mut [FreshCell], full: bool, fine: bool, stop: &dyn Fn() -> bool) -> bool {
+/// Two passes for latency (owner, 2026-10-29): a coarse one (`fine_pass` false) draws each component pixel from its centre cell, a sixteenth of a 4 × 4 fine pass's work, boot included, four pixels to a lane call, to be on the glass at once; a fine one draws all k² cells to clear it up a moment later. `stop` is asked before every row: true leaves the pass where it is and returns false (a newer handle is waiting); a finished pass returns true.
+pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], text: &str, k: u32, inside: &mut [u64], coarse: &mut [FreshCell], fine: &mut [FreshCell], full: bool, fine_pass: bool, stop: &dyn Fn() -> bool) -> bool {
     let th = Theme::from_bytes(&draw(salt, 1, 0, &[]));
     let aura = soft(&th, 0.72, 0.15, 0., (0., 0.));
     // The attest ball's look, but tapering into the device's colour by √(1 − |p|²) (owner, 2026-10-29): in a component it reads as a lit sphere glowing into the outline, not a button; the bound identity's mark keeps √(1 − |p|¹²).
@@ -1551,13 +1557,15 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
     };
     // A component's cell from λ and its radius in pixels: λ as the ball's disc point (Im λ, Re λ), so in the main cardioid, where λ ≈ 2c near its centre, the ball stands as the screen does (right is +Im, down is +Re).
     // WHY the bound on |p|, as a length: λ within a rounding of a rim can come out at or past 1, outside the ball, where its √(1 − |p|²) is NaN (a white speck, about 20 to a 600 px mark when each coordinate was held on its own, 2026-10-29, since the diagonals still passed 1); scaled back to |p| = 1 − 2⁻¹⁵ it is the rim's colour either way, |p|² stays below 1, and neither i16 can reach ±2¹⁵.
-    let comp = |lam: (f32, f32), r_pic: f32| -> FreshCell {
+    // `ang` (turns) is arg λ′, λ′ = dλ/dc: how far the component's ball stands turned on the glass. Screen to c swaps the axes, c to λ is holomorphic and λ to the disc point swaps them back, each swap i·conj, so screen to disc point is multiplication by conj(λ′)·scale: the picture keeps that turn (owner, 2026-10-29: the set inside a component stands as λ puts it) and only the lamps are turned to match (`ball`), so they shine from the top left of the screen in every component. The cardioid and the period-2 disc have it in closed form (λ′ = 2/√(1 − 4c), and 4); every other component takes it from the step it measures its size by.
+    let comp = |lam: (f32, f32), r_pic: f32, ang: f32| -> FreshCell {
         let top = 1. - 1. / q15;
         let l2 = lam.0 * lam.0 + lam.1 * lam.1;
         let s = if l2 > top * top { top / l2.sqrt() } else { 1. };
         let (qx, qy) = (lam.1 * s * q15, lam.0 * s * q15);
-        // WHY the floor on ρ: at the cardioid's cusp (c = ¼ exactly) the radius is 0 and log₂ 0 = −∞, which as an i16 would read as OUTSIDE; one above RIM is a radius of 2⁻¹²⁸, all rim.
-        [qx as i16, qy as i16, (r_pic.flog2() * (1 << 8) as f32).max(RIM as f32 + 1.) as i16]
+        // WHY the floor on ρ: at the cardioid's cusp (c = ¼ exactly) the radius is 0 and log₂ 0 = −∞, which as an i16 would read as OUTSIDE; one above UNSET (the last code) is a radius of 2⁻¹²⁸, all rim.
+        // The angle in 16-bit turns, wrapped (an i32 cut to its low 16 bits).
+        [qx as i16, qy as i16, (r_pic.flog2() * (1 << 8) as f32).max(UNSET as f32 + 1.) as i16, (ang * (1u32 << 16) as f32) as i32 as i16]
     };
     // A point of the parameter plane: escaped (its distance in pixels), inside a component found (λ), or neither within the search.
     enum Pt {
@@ -1610,22 +1618,23 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
             let m = (ax * ax + ay * ay).sqrt();
             let (sx, sy) = (((m + ax) * 0.5).sqrt(), ((m - ax) * 0.5).sqrt());
             let sy = if ay < 0. { -sy } else { sy };
-            return comp((1. - sx, -sy), m.sqrt() / (2. * scale));
+            return comp((1. - sx, -sy), m.sqrt() / (2. * scale), -sy.fatan2(sx) * (1. / TAU as f32));
         }
         if (c.0 + 1.) * (c.0 + 1.) + y2 < 1. / 16. {
-            return comp((4. * (c.0 + 1.), 4. * c.1), 1. / (4. * scale));
+            return comp((4. * (c.0 + 1.), 4. * c.1), 1. / (4. * scale), 0.);
         }
         match probe(c) {
-            Pt::Out(d) => [(glow(d) * (q15 - 1.)) as i16, 0, OUTSIDE],
+            Pt::Out(d) => [(glow(d) * (q15 - 1.)) as i16, 0, OUTSIDE, 0],
             Pt::In(lam) => match probe((c.0 + scale * 0.5, c.1)) {
-                // λ half a pixel along: |dλ/dpixel| = 2·|λ₂ − λ|.
+                // λ half a pixel along +Re c: |dλ/dpixel| = 2·|λ₂ − λ|, and λ₂ − λ points along λ′ (the step in c is real).
                 Pt::In(l2) => {
                     let (ex, ey) = (l2.0 - lam.0, l2.1 - lam.1);
-                    comp(lam, 1. / (2. * (ex * ex + ey * ey).sqrt()))
+                    let e = (ex * ex + ey * ey).sqrt();
+                    comp(lam, 1. / (2. * e), ey.fatan2(ex) * (1. / TAU as f32))
                 }
-                _ => [0, 0, RIM],
+                _ => [0, 0, RIM, 0],
             },
-            Pt::Slow => [0, 0, RIM],
+            Pt::Slow => [0, 0, RIM, 0],
         }
     };
     // The colour (display gamma) and coverage of a cell that is not a component's: the glow outside, or the device's colour on a rim. A component's is the ball (`ball`), four samples at a time.
@@ -1636,18 +1645,16 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
     let (y0, y1) = ((cy - r - 1.) as usize, (cy + r + 2.) as usize);
     let kf = k as f32;
     let kk2 = (k * k) as usize;
-    // The one cell a coarse pass draws for a pixel: the grid's cell nearest its centre.
-    let m0 = ((k / 2) * k + k / 2) as usize;
     // Up to four components' cells shaded in one lane call; a short call fills its spare lanes with its first cell (the same orbit, so it never runs longer) and drops their colours.
     let shade4 = |cs: &[FreshCell]| -> [[f32; 3]; 4] {
         let mut at4 = [cs[0]; 4];
         at4[..cs.len()].copy_from_slice(cs);
         let lane = |j: usize| F4(at4.map(|c| c[j] as f32));
-        let c = ball((lane(0) * (1. / q15), lane(1) * (1. / q15)), lane(2), &v, rad, &look, aura);
+        let c = ball((lane(0) * (1. / q15), lane(1) * (1. / q15)), lane(2), lane(3) * (1. / (1u32 << 16) as f32), &v, rad, &look, aura);
         [0, 1, 2, 3].map(|n| [c[0].0[n], c[1].0[n], c[2].0[n]])
     };
     // A coarse pass's component pixels waiting for a lane call: (pixel, cell).
-    let mut pend = [(0usize, [0i16; 3]); 4];
+    let mut pend = [(0usize, [0i16; 4]); 4];
     let mut np = 0;
     let flush = |pend: &[(usize, FreshCell)], buf: &mut [u64]| {
         if pend.is_empty() {
@@ -1662,62 +1669,50 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
             buf[i] = pack16(cols[j], 1.);
         }
     };
-    // The next map entry, across the masked pixels' samples in order.
-    let mut at = 0usize;
+    // The next entries of the two maps, across the masked pixels in order: one coarse cell a pixel, k² fine cells a pixel.
+    let (mut at_c, mut at_f) = (0usize, 0usize);
     for py in y0..y1 {
         if stop() {
             return false;
         }
         for px in x0..x1 {
             let i = py * w + px;
-            let masked = inside[i >> 6] >> (i & 63) & 1 == 1;
-            if !full && !masked {
-                continue;
-            }
+            // The pixel's centre cell: worked out by the full pass (which keeps it, and sets the pixel's fine cells to be worked out by the first fine pass that reaches them), read back by every other.
             // Only the components are anti-aliased (owner, 2026-10-29): the outline and its halo come from the distance estimate, smooth in pixels already, so a pixel whose centre falls outside takes that one sample and keeps no map entries. A component's rim and the line outside it are the same colour, so where a pixel's centre misses a rim it covers, nothing shows.
-            if full {
-                let centre_cell = cell(px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
-                if centre_cell[2] == OUTSIDE {
+            let centre_cell = if full {
+                let cc = cell(px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+                if cc[2] == OUTSIDE {
                     inside[i >> 6] &= !(1u64 << (i & 63));
-                    let (s, a) = plain(centre_cell);
+                    let (s, a) = plain(cc);
                     buf[i] = pack16(s, a);
                     continue;
                 }
-            }
-            // k up to 2³: 2⁶ samples a pixel.
-            let mut cells = [[0i16; 3]; 1 << 6];
-            let mut any = false;
-            for m in 0..kk2 {
-                let (jx, jy) = jitter::<f32>(px as u32, py as u32, m as u32);
-                let (sx, sy) = (((m as u32 % k) as f32 + jx) / kf, ((m as u32 / k) as f32 + jy) / kf);
-                let fresh = || cell(px as f32 + sx - cx, py as f32 + sy - cy);
-                cells[m] = if full { fresh() } else if at + m < map.len() { map[at + m] } else { fresh() };
-                any |= cells[m][2] != OUTSIDE;
-            }
-            if full {
-                let bit = 1u64 << (i & 63);
-                inside[i >> 6] = if any { inside[i >> 6] | bit } else { inside[i >> 6] & !bit };
-                if any {
-                    for m in 0..kk2 {
-                        if at + m < map.len() {
-                            map[at + m] = cells[m];
-                        }
+                inside[i >> 6] |= 1u64 << (i & 63);
+                if at_c < coarse.len() {
+                    coarse[at_c] = cc;
+                }
+                for m in 0..kk2 {
+                    if at_f + m < fine.len() {
+                        fine[at_f + m] = [0, 0, UNSET, 0];
                     }
                 }
-            }
-            if full && !any {
-                // Outside only: never redrawn, no map entries.
+                cc
             } else {
-                at += kk2;
-            }
+                if inside[i >> 6] >> (i & 63) & 1 == 0 {
+                    continue;
+                }
+                if at_c < coarse.len() { coarse[at_c] } else { cell(px as f32 + 0.5 - cx, py as f32 + 0.5 - cy) }
+            };
+            let f0 = at_f;
+            at_c += 1;
+            at_f += kk2;
             // A coarse pass: the centre cell alone, components gathered four pixels to a lane call.
-            if !fine {
-                let c = cells[m0];
-                if c[2] == OUTSIDE || c[2] == RIM {
-                    let (s, a) = plain(c);
+            if !fine_pass {
+                if centre_cell[2] == OUTSIDE || centre_cell[2] == RIM {
+                    let (s, a) = plain(centre_cell);
                     buf[i] = pack16(s, a);
                 } else {
-                    pend[np] = (i, c);
+                    pend[np] = (i, centre_cell);
                     np += 1;
                     if np == 4 {
                         flush(&pend, buf);
@@ -1726,7 +1721,25 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
                 }
                 continue;
             }
-            // A fine pass: every cell, in sample order so they add up in the order they always did; the plain ones one by one, the components' gathered and shaded four at a time.
+            // A fine pass: the k × k cells, each worked out the first time a fine pass reaches it and kept (a pass stopped part way keeps what it did).
+            // k up to 2³: 2⁶ samples a pixel.
+            let mut cells = [[0i16; 4]; 1 << 6];
+            for m in 0..kk2 {
+                let fresh = || {
+                    let (jx, jy) = jitter::<f32>(px as u32, py as u32, m as u32);
+                    let (sx, sy) = (((m as u32 % k) as f32 + jx) / kf, ((m as u32 / k) as f32 + jy) / kf);
+                    cell(px as f32 + sx - cx, py as f32 + sy - cy)
+                };
+                cells[m] = if f0 + m < fine.len() {
+                    if fine[f0 + m][2] == UNSET {
+                        fine[f0 + m] = fresh();
+                    }
+                    fine[f0 + m]
+                } else {
+                    fresh()
+                };
+            }
+            // Every cell, in sample order so they add up in the order they always did; the plain ones one by one, the components' gathered and shaded four at a time.
             let mut cols = [([0f32; 3], 0f32); 1 << 6];
             let mut comps = [0usize; 1 << 6];
             let mut n_comps = 0;
@@ -1765,9 +1778,9 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
     true
 }
 
-/// The fresh mark's ball in a component (`render_fresh`): the attest ball's colour (display gamma) at disc point p, at the component's scale (`rho`, log₂ of its radius in pixels, Q8), tapering into `aura` at the rim by the look's vignette; one sample or four (`Lane`).
+/// The fresh mark's ball in a component (`render_fresh`): the attest ball's colour (display gamma) at disc point p, at the component's scale (`rho`, log₂ of its radius in pixels, Q8), its lamps turned by the component's `ang` so they shine from the top left of the glass, tapering into `aura` at the rim by the look's vignette; one sample or four (`Lane`).
 #[inline]
-fn ball<L: Lane>(p: (L, L), rho: L, v: &View, rad: f32, look: &Look, aura: [f32; 3]) -> [L; 3] {
+fn ball<L: Lane>(p: (L, L), rho: L, ang: L, v: &View, rad: f32, look: &Look, aura: [f32; 3]) -> [L; 3] {
     let one = L::splat(1.);
     let r_pic = (rho * (1. / (1 << 8) as f32)).fexp2();
     let q2 = p.0 * p.0 + p.1 * p.1;
@@ -1777,7 +1790,9 @@ fn ball<L: Lane>(p: (L, L), rho: L, v: &View, rad: f32, look: &Look, aura: [f32;
     let (x, y) = (a * v.rot.0 + v.centre.0 - b * v.rot.1, a * v.rot.1 + v.centre.1 + b * v.rot.0);
     let kk = L::splat(rad) / (r_pic * (one - q2));
     let taper = (one - q2.powi(look.vignette / 2)).sqrt();
-    let c = shade(x, y, v, kk, look, (p.0, p.1, (one - q2).sqrt()), r_pic * (1. / (1 << 7) as f32)).0;
+    // The glass to the picture: the component turns the picture by arg λ′ (`ang`, turns) on the glass, so a direction on the glass is e^(−i·arg λ′) of one in the picture; the lamps, placed on the glass, come in through it.
+    let frame = (fm::sin_turns(ang + 0.25), -fm::sin_turns(ang));
+    let c = shade(x, y, v, kk, look, (p.0, p.1, (one - q2).sqrt()), r_pic * (1. / (1 << 7) as f32), frame).0;
     [0, 1, 2].map(|i| (c[i] - aura[i]) * taper + aura[i])
 }
 
