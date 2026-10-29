@@ -1467,17 +1467,21 @@ fn mirrored(mut v: View, look: &Look) -> View {
     v
 }
 
+/// One sample of the fresh mark's map, what its point is in the parameter plane (never the text), in 16-bit words, so a new handle redraws without iterating the set: a component's point as [x, y, ρ] with the ball's disc point (x, y) in Q15 (|p| < 1, 2⁻¹⁵ resolution) and ρ = log₂ of the component's radius in pixels, Q8 (0.27% steps); the set's glow outside as [light Q15, 0, OUTSIDE]; the device's colour (a rim, or no cycle found) as [0, 0, RIM].
+pub type FreshCell = [i16; 3];
+const OUTSIDE: i16 = i16::MIN;
+const RIM: i16 = i16::MIN + 1;
+
 /// The fresh mark (attest, a device no identity has attested on yet): the Mandelbrot set itself, antenna up, filling a disc of radius `r` pixels centred at (`cx`, `cy`), in the device's colour, with the device's attest ball inside every hyperbolic component; everything from `salt` (the device's own, from its ira), and the ball also from `text`, the textbox, as the attest ball follows it (each character nudging it, `Params::new`).
 /// Outside is black, with a glow from the distance estimate shaped as ferros's circles glow (`render_button`): the set's line at full light, a halo at half, down by the same step every octave of distance, gone 1/GLOW_FRACTION of `r` out. It never depends on the text.
 /// Inside, a component is a disc to its multiplier λ (the attracting cycle's (fᵖ)′, a conformal map of the component onto the unit disc, 0 at its centre and of size 1 on its rim): the main cardioid and the period-2 disc have it in closed form (1 − √(1 − 4c) and 4(c + 1)); every other point iterates 2⁹ steps to settle, then finds its cycle (the first return within 2⁻²⁰) and multiplies 2z around it.
 /// The disc is the attest ball's disc, point for point: the same view, `shade` and `Look::attest()` (style, material, engraving, mirror, electric flame), tapering into the device's colour at the rim by √(1 − |p|²) rather than the button's twelfth power, which is the colour of the set's line outside, so every component blends into the outline. The ball's scale in pixels is the component's: its radius is 1/|dλ/dpixel| (in closed form for the cardioid and the period-2 disc, |λ′| = 2/|√(1 − 4c)| and 4; elsewhere λ again half a pixel along and the difference), and its lines are 2⁻⁷ of that, as the ball's are of its own.
 /// Where no cycle is found within 2⁶ steps (right at a rim, converging slowly, or a period past 2⁶) the device's colour stands, as the ball's rim does.
-/// `inside` is a bitmask of the pixels (one bit per pixel of `buf`, 64 a word, row after row) that hold any of a component: with `full` every pixel renders and the mask is written; without, only the masked pixels render, so a new `text` redraws the balls and leaves the outline as it was.
+/// `inside` is a bitmask of the pixels (one bit per pixel of `buf`, 64 a word, row after row) that hold any of a component, and `map` the masked pixels' samples (`FreshCell`, in pixel order, k² a pixel): with `full` every pixel renders and both are written; without, only the masked pixels render, from the map, so a new `text` costs the balls' shading alone and leaves the outline as it was. A map too short for every masked sample holds the first ones; the rest are worked out again each time. The full render draws from the cells as stored, so the first keystroke moves nothing but the ball.
 /// Sampling: a `k` × `k` stratified grid per pixel, averaged in linear light with coverage (the glow is light over the background, coverage its brightness).
-pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], text: &str, k: u32, inside: &mut [u64], full: bool) {
+pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], text: &str, k: u32, inside: &mut [u64], map: &mut [FreshCell], full: bool) {
     let th = Theme::from_bytes(&draw(salt, 1, 0, &[]));
     let aura = soft(&th, 0.72, 0.15, 0., (0., 0.));
-    // The attest ball, as `render_button` draws it.
     // The attest ball's look, but tapering into the device's colour by √(1 − |p|²) (owner, 2026-10-29): in a component it reads as a lit sphere glowing into the outline, not a button; the bound identity's mark keeps √(1 − |p|¹²).
     let look = Look { vignette: 2, ..Look::attest() };
     let params = Params::new(salt, text);
@@ -1488,6 +1492,7 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
     let scale = 1.2357 * (1. + 1. / GLOW_FRACTION) / r;
     let reach = r / GLOW_FRACTION;
     let octaves = (1 << GLOW_OCTAVES_LOG2) as f32;
+    let q15 = (1u32 << 15) as f32;
     // A distance d (pixels) past the set's edge: its line at full light and the halo at half (the light, coverage over black).
     // WHY the floor of 2⁻⁸ of the reach: d is exactly 0 where the derivative overflowed (on the set), and log₂ 0 is −∞; the floor holds the glow at full there, 2⁴ times inside where it is already full.
     let glow = |d: f32| -> f32 {
@@ -1495,23 +1500,15 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
         let line = (-(d * d)).exp2();
         line + (1. - line) * 0.5 * (positive_part(1. - u) - positive_part(-u))
     };
-    // The ball at disc point p (x right, y down, as the ball's own) for a component `r_pic` pixels in radius.
-    let ball = |p: (f32, f32), r_pic: f32| -> [f32; 3] {
-        let q2 = p.0 * p.0 + p.1 * p.1;
-        // On the rim the warp is infinite and the taper 0: the device's colour.
-        if q2 >= 1. {
-            return aura;
-        }
-        let g = rad / (1. - q2).sqrt();
-        let (a, b) = (p.0 * g, p.1 * g);
-        let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
-        let kk = rad / (r_pic * (1. - q2));
-        let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
-        let c = shade(x, y, &v, kk, &look, (p.0, p.1, (1. - q2).sqrt()), r_pic * (1. / (1 << 7) as f32)).0;
-        [0, 1, 2].map(|i| aura[i] + (c[i] - aura[i]) * taper)
+    // A component's cell from λ and its radius in pixels: λ as the ball's disc point (Im λ, Re λ), so in the main cardioid, where λ ≈ 2c near its centre, the ball stands as the screen does (right is +Im, down is +Re).
+    // WHY the bound on |p|: a point a rounding inside a rim would round to 1 (outside the ball) in Q15; held at 1 − 2⁻¹⁵ it is the rim's colour either way, and the i16 cannot wrap to −1.
+    let comp = |lam: (f32, f32), r_pic: f32| -> FreshCell {
+        let top = q15 - 1.;
+        let qx = (lam.1 * q15).max(-top).min(top);
+        let qy = (lam.0 * q15).max(-top).min(top);
+        // WHY the floor on ρ: at the cardioid's cusp (c = ¼ exactly) the radius is 0 and log₂ 0 = −∞, which as an i16 would read as OUTSIDE; one above RIM is a radius of 2⁻¹²⁸, all rim.
+        [qx as i16, qy as i16, (r_pic.log2() * (1 << 8) as f32).max(RIM as f32 + 1.) as i16]
     };
-    // λ as the ball's disc point: (Im λ, Re λ), so in the main cardioid, where λ ≈ 2c near its centre, the ball stands as the screen does (right is +Im, down is +Re).
-    let disc = |lam: (f32, f32)| (lam.1, lam.0);
     // A point of the parameter plane: escaped (its distance in pixels), inside a component found (λ), or neither within the search.
     enum Pt {
         Out(f32),
@@ -1551,8 +1548,8 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
         }
         Pt::Slow
     };
-    // One sample at (dx, dy) pixels from the centre: its colour (display gamma), coverage, and whether it fell inside a component. Up the screen is toward Re −2 (the antenna), right is +Im.
-    let sample = |dx: f32, dy: f32| -> ([f32; 3], f32, bool) {
+    // What a sample at (dx, dy) pixels from the centre is, as a cell. Up the screen is toward Re −2 (the antenna), right is +Im.
+    let cell = |dx: f32, dy: f32| -> FreshCell {
         let c = (centre + dy * scale, dx * scale);
         // The main cardioid and the period-2 disc, in closed form.
         let (xq, y2) = (c.0 - 0.25, c.1 * c.1);
@@ -1563,53 +1560,93 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
             let m = (ax * ax + ay * ay).sqrt();
             let (sx, sy) = (((m + ax) * 0.5).sqrt(), ((m - ax) * 0.5).sqrt());
             let sy = if ay < 0. { -sy } else { sy };
-            let r_pic = m.sqrt() / (2. * scale);
-            return (ball(disc((1. - sx, -sy)), r_pic), 1., true);
+            return comp((1. - sx, -sy), m.sqrt() / (2. * scale));
         }
         if (c.0 + 1.) * (c.0 + 1.) + y2 < 1. / 16. {
-            return (ball(disc((4. * (c.0 + 1.), 4. * c.1)), 1. / (4. * scale)), 1., true);
+            return comp((4. * (c.0 + 1.), 4. * c.1), 1. / (4. * scale));
         }
         match probe(c) {
-            Pt::Out(d) => (aura, glow(d), false),
+            Pt::Out(d) => [(glow(d) * (q15 - 1.)) as i16, 0, OUTSIDE],
             Pt::In(lam) => match probe((c.0 + scale * 0.5, c.1)) {
                 // λ half a pixel along: |dλ/dpixel| = 2·|λ₂ − λ|.
                 Pt::In(l2) => {
                     let (ex, ey) = (l2.0 - lam.0, l2.1 - lam.1);
-                    (ball(disc(lam), 1. / (2. * (ex * ex + ey * ey).sqrt())), 1., true)
+                    comp(lam, 1. / (2. * (ex * ex + ey * ey).sqrt()))
                 }
-                _ => (aura, 1., true),
+                _ => [0, 0, RIM],
             },
-            Pt::Slow => (aura, 1., true),
+            Pt::Slow => [0, 0, RIM],
+        }
+    };
+    // A cell's colour (display gamma), coverage, and whether it is a component's: the ball at the disc point, at the component's scale.
+    let colour = |cl: FreshCell| -> ([f32; 3], f32, bool) {
+        match cl[2] {
+            OUTSIDE => (aura, cl[0] as f32 / q15, false),
+            RIM => (aura, 1., true),
+            rho => {
+                let p = (cl[0] as f32 / q15, cl[1] as f32 / q15);
+                let r_pic = (rho as f32 * (1. / (1 << 8) as f32)).exp2();
+                let q2 = p.0 * p.0 + p.1 * p.1;
+                let g = rad / (1. - q2).sqrt();
+                let (a, b) = (p.0 * g, p.1 * g);
+                let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
+                let kk = rad / (r_pic * (1. - q2));
+                let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
+                let c = shade(x, y, &v, kk, &look, (p.0, p.1, (1. - q2).sqrt()), r_pic * (1. / (1 << 7) as f32)).0;
+                ([0, 1, 2].map(|i| aura[i] + (c[i] - aura[i]) * taper), 1., true)
+            }
         }
     };
     let (x0, x1) = ((cx - r - 1.) as usize, (cx + r + 2.) as usize);
     let (y0, y1) = ((cy - r - 1.) as usize, (cy + r + 2.) as usize);
     let kf = k as f32;
+    // The next map entry, across the masked pixels' samples in order.
+    let mut at = 0usize;
     for py in y0..y1 {
         for px in x0..x1 {
             let i = py * w + px;
-            if !full && inside[i >> 6] >> (i & 63) & 1 == 0 {
+            let masked = inside[i >> 6] >> (i & 63) & 1 == 1;
+            if !full && !masked {
                 continue;
             }
-            let mut sum = [0f32; 3];
-            let mut cover = 0f32;
+            // k up to 2³: 2⁶ samples a pixel.
+            let mut cells = [[0i16; 3]; 1 << 6];
+            let kk2 = (k * k) as usize;
             let mut any = false;
-            for m in 0..k * k {
-                let (jx, jy) = jitter(px as u32, py as u32, m);
-                let (sx, sy) = (((m % k) as f32 + jx) / kf, ((m / k) as f32 + jy) / kf);
-                let (s, a, is_in) = sample(px as f32 + sx - cx, py as f32 + sy - cy);
-                for i in 0..3 {
-                    sum[i] += s[i] * s[i] * a;
-                }
-                cover += a;
-                any |= is_in;
+            for m in 0..kk2 {
+                let (jx, jy) = jitter(px as u32, py as u32, m as u32);
+                let (sx, sy) = (((m as u32 % k) as f32 + jx) / kf, ((m as u32 / k) as f32 + jy) / kf);
+                let fresh = || cell(px as f32 + sx - cx, py as f32 + sy - cy);
+                cells[m] = if full { fresh() } else if at + m < map.len() { map[at + m] } else { fresh() };
+                any |= cells[m][2] != OUTSIDE;
             }
             if full {
                 let bit = 1u64 << (i & 63);
                 inside[i >> 6] = if any { inside[i >> 6] | bit } else { inside[i >> 6] & !bit };
+                if any {
+                    for m in 0..kk2 {
+                        if at + m < map.len() {
+                            map[at + m] = cells[m];
+                        }
+                    }
+                }
+            }
+            if full && !any {
+                // Outside only: never redrawn, no map entries.
+            } else {
+                at += kk2;
+            }
+            let mut sum = [0f32; 3];
+            let mut cover = 0f32;
+            for m in 0..kk2 {
+                let (s, a, _) = colour(cells[m]);
+                for i in 0..3 {
+                    sum[i] += s[i] * s[i] * a;
+                }
+                cover += a;
             }
             let rgb = if cover > 0. { sum.map(|c| (c / cover).sqrt()) } else { [0.; 3] };
-            buf[i] = pack(rgb, cover / (k * k) as f32);
+            buf[i] = pack(rgb, cover / kk2 as f32);
         }
     }
 }
