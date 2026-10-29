@@ -535,8 +535,6 @@ struct Attest {
     /// The metals (indices into `METALS`): `metal_a` for the set and the wires, `metal_b` for a medal's field and the button's bezel; the same metal for half of devices, two for the rest (a bimetal).
     metal_a: u8,
     metal_b: u8,
-    /// The button's bezel: 0 a plain round, 1 reeded (fine ridges across it, as a coin's edge), 2 a double ring.
-    bezel: u8,
     /// The enamel's cell colours: a seed for which of the four each cell takes.
     cells: u32,
 }
@@ -554,7 +552,6 @@ impl Attest {
             style: 1 + a[5] % 3,
             metal_a,
             metal_b: if a[7] & 1 == 0 { metal_a } else { (metal_a + 1 + (a[7] >> 1) % 7) & 7 },
-            bezel: a[8] % 3,
             cells: u32::from_le_bytes([a[9], a[10], a[11], a[12]]),
         }
     }
@@ -864,12 +861,12 @@ const METALS: [[f32; 3]; 8] = [
     [0.52, 0.56, 0.70],
 ];
 
-/// A studio around the picture, as a metal sees it: the brightness reflected along `rr` (a unit vector, screen x right, y down, z out), a bright sky above falling smoothly to a dim floor below, and a soft-box at the key lamp `l`.
+/// A studio around the picture, as a metal sees it: the brightness reflected along `rr` (a unit vector, screen x right, y down, z out), a bright sky above falling smoothly to a dim floor below, and a faint soft-box at the key lamp `l`.
 #[inline]
 fn studio(rr: (f32, f32, f32), l: (f32, f32, f32)) -> f32 {
     let sky = 0.5 - 0.5 * (3. * rr.1).tanh();
     let lamp = positive_part(rr.0 * l.0 + rr.1 * l.1 + rr.2 * l.2).powi(1 << 5);
-    0.0625 + 0.5 * sky + 1.5 * lamp
+    0.0625 + 0.5 * sky + 0.375 * lamp
 }
 
 /// A metal of colour `base` (linear) with unit normal `n`, lit by the studio: the view straight down the z axis reflected about n, tinted by the metal, in linear light.
@@ -909,7 +906,7 @@ pub struct Look {
     pub mirror: Pick,
     /// How the picture is made (see `Attest::style`): 0 soft colours, 1 medal, 2 enamel, 3 lacquer.
     pub style: Pick,
-    /// Wrap the picture as a round button: a metal bezel, a glass dome over the picture, the bezel's shadow inside and a drop shadow outside.
+    /// Wrap the picture as a round button: the ball a little smaller, over a soft drop shadow.
     pub button: bool,
 }
 
@@ -1089,7 +1086,7 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
             expose(metal(base, n, l).map(|c| c * (1. - 0.5 * line)))
         }
         2 => {
-            // Enamel (cloisonné): each cell between the engraving's lines filled with one of four colours around the theme's hue (richer than the avatars' but held under the same gamut cap), the set's dust and the wires in `metal_a`, all under a glossy glaze.
+            // Enamel (cloisonné): each cell between the engraving's lines filled with one of four colours around the theme's hue (richer than the avatars' but held under the same gamut cap), the set's dust and the wires in `metal_a`, under a faint glaze.
             // A cell's colour comes from a hash of its level and ray indices; where the cells crowd near the set (as their lines fade) the colours fade to the first of the four, the theme's own hue, so they never speckle.
             let cl = (o.lv * m_lv).floor() as i32;
             let cr = if engrave & 2 == 2 { (o.ray * n_ray).floor() as i32 } else { 0 };
@@ -1102,8 +1099,8 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
             let gold = metal(METALS[v.attest.metal_a as usize], n, l);
             let w = 1. - (1. - raised) * (1. - line);
             let lin = [0, 1, 2].map(|i| cell[i] + (gold[i] - cell[i]) * w);
-            // The glaze: a glossy highlight on the ball's own curve.
-            let spec = 0.625 * facing(unit3(sphere)).powi(1 << 6);
+            // The glaze: a faint sheen of the key lamp on the relief's own slope (a quarter of the ball's curve under it), so it catches the set's walls instead of sitting on the ball like glass.
+            let spec = 0.125 * facing(unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, 1.))).powi(1 << 5);
             expose(lin).map(|c| c + spec * (1. - c))
         }
         _ => {
@@ -1113,7 +1110,7 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
             let n = unit3((sphere.0 * 0.5 + rx, sphere.1 * 0.5 + ry, 1.));
             let gold = metal(METALS[v.attest.metal_a as usize], n, l);
             let lin = [0, 1, 2].map(|i| lacquer[i] + (gold[i] - lacquer[i]) * raised);
-            let spec = 0.625 * facing(unit3(sphere)).powi(1 << 6);
+            let spec = 0.125 * facing(unit3((sphere.0 * 0.25 + rx, sphere.1 * 0.25 + ry, 1.))).powi(1 << 5);
             expose(lin).map(|c| c + spec * (1. - c))
         }
     };
@@ -1237,9 +1234,8 @@ pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, 
         .reduce(|| vec![0u64; MAX_SAMPLES + 1], |a, b| a.iter().zip(&b).map(|(x, y)| x + y).collect())
 }
 
-/// The button's bezel: its outer edge at 2⁻³ in from the disc's (the drop shadow fills the rest), 2⁻³ of the disc's radius wide; the picture sits inside it.
-const BEZEL_OUT: f32 = 1. - 1. / (1 << 3) as f32;
-const BEZEL_IN: f32 = BEZEL_OUT - 1. / (1 << 3) as f32;
+/// The button's ball: its edge at 2⁻³ in from the disc's, the drop shadow filling the rest.
+const BALL: f32 = 1. - 1. / (1 << 3) as f32;
 
 /// The logistic 1/(1 + e^(−x)), C∞.
 #[inline]
@@ -1247,15 +1243,11 @@ fn logistic(x: f32) -> f32 {
     1. / (1. + (-x).exp())
 }
 
-/// The mark as a round button (attest), in a disc of radius `r` pixels centred at (`cx`, `cy`): four faux layers, from the bottom up.
-/// A drop shadow, cast down and away from the key lamp, out to the disc's own edge (where it has faded to nothing, smoothly, as 1 − s¹⁶).
-/// A metal bezel in `metal_b`, its cross-section a half-round, a double ring, or a half-round reeded across with 2⁷ fine ridges (as a coin's edge), lit by the same studio as the medal.
-/// The picture inside it, spherized as `render_disc` does, with the bezel's shadow falling across its edge on the lamp's side.
-/// A glass dome over the picture: a sharp highlight of the key lamp and a broad soft one.
-/// Every layer is opaque but the shadow, so samples are averaged with their coverage (premultiplied, in linear light); pixels across the bezel's two edges take at least 2³ samples, since a sharp circle can fall between two jittered samples on one side.
+/// The mark as a round button (attest), in a disc of radius `r` pixels centred at (`cx`, `cy`): the picture as a ball, spherized as `render_disc` does, over a drop shadow cast down and away from the key lamp out to the disc's own edge (where it has faded to nothing, smoothly, as 1 − s¹⁶). No rim, no glass: what shine there is comes from the set's own slope (see `shade`).
+/// The ball is opaque and the shadow is not, so samples are averaged with their coverage (premultiplied, in linear light); pixels across the ball's edge take at least 2³ samples, since a sharp circle can fall between two jittered samples on one side.
 fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) -> Vec<u64> {
     let v = mirrored(p.view(), look);
-    let r_pic = r * BEZEL_IN;
+    let r_pic = r * BALL;
     let hair = r_pic * (1. / (1 << 7) as f32);
     let rad = p.radius as f32;
     let fixed = Lighting::fixed();
@@ -1263,10 +1255,6 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
     let turn = (TAU as f32 * v.keyed.light_turn).sin_cos();
     let l = { let d = lt.key.dir; (d.0 * turn.1 - d.1 * turn.0, d.0 * turn.0 + d.1 * turn.1, d.2) };
     let lh = { let m = (l.0 * l.0 + l.1 * l.1).sqrt(); (l.0 / m, l.1 / m) };
-    let half = unit3((l.0, l.1, l.2 + 1.));
-    let facing = |n: (f32, f32, f32)| positive_part(n.0 * half.0 + n.1 * half.1 + n.2 * half.2);
-    let bezel_metal = METALS[v.attest.metal_b as usize];
-    let pi = std::f32::consts::PI;
     // One sample at (dx, dy) pixels from the centre: its colour (display gamma) and its coverage.
     let sample = |dx: f32, dy: f32| -> ([f32; 3], f32) {
         let (sx, sy) = (dx / r, dy / r);
@@ -1274,59 +1262,25 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
         if s2 >= 1. {
             return ([0.; 3], 0.);
         }
-        let s = s2.sqrt();
-        if s >= BEZEL_OUT {
-            // The drop shadow: a disc the bezel's size, moved half the margin away from the lamp, its edge softened over about 2⁻⁵ of the radius.
-            let off = (1. - BEZEL_OUT) * 0.5;
+        if s2 >= BALL * BALL {
+            // The drop shadow: a disc the ball's size, moved half the margin away from the lamp, its edge softened over about 2⁻⁵ of the radius.
+            let off = (1. - BALL) * 0.5;
             let (ox, oy) = (sx + lh.0 * off, sy + lh.1 * off);
             let so = (ox * ox + oy * oy).sqrt();
-            let a = 0.5 * logistic((BEZEL_OUT - so) * (1 << 5) as f32) * (1. - s2.powi(1 << 3));
+            let a = 0.5 * logistic((BALL - so) * (1 << 5) as f32) * (1. - s2.powi(1 << 3));
             return ([0.; 3], a);
         }
-        if s >= BEZEL_IN {
-            // The bezel: t across it from the picture's edge (0) to its own (1); the cross-section's height h(t) in bezel widths and its slope dh/dx, and the surface normal leaning down the slope (inward where the height rises outward).
-            let t = (s - BEZEL_IN) / (BEZEL_OUT - BEZEL_IN);
-            let (ux, uy) = (sx / s, sy / s);
-            let slope = match v.attest.bezel {
-                // A double ring: h = ¼·sin²(2πt), two rounded ridges.
-                2 => 0.5 * pi * (4. * pi * t).sin(),
-                // A half-round: h = ½·sin(πt).
-                _ => 0.5 * pi * (pi * t).cos(),
-            };
-            // Reeding: ridges across the bezel, 2⁷ around, as a tangential lean of ±⅓; they fade as they crowd below 2³ hairs apart, so a small button shows a plain bezel.
-            let reed = if v.attest.bezel == 1 {
-                let around = (1 << 7) as f32;
-                let spacing = TAU as f32 * s * r / around;
-                let crowd = 8. * hair;
-                (1. / 3.) * (around * sy.atan2(sx)).sin() * spacing * spacing / (spacing * spacing + crowd * crowd)
-            } else {
-                0.
-            };
-            let n = unit3((-slope * ux - reed * uy, -slope * uy + reed * ux, 1.));
-            // The crease where the bezel meets the picture is shadowed: dark at t = 0, gone by t ≈ 2⁻².
-            let crease = 1. - 0.5 * (-(t * 8.) * (t * 8.)).exp2();
-            return (expose(metal(bezel_metal, n, l).map(|c| c * crease)), 1.);
-        }
-        // The picture, spherized inside the bezel.
-        let (qx, qy) = (sx / BEZEL_IN, sy / BEZEL_IN);
+        let (qx, qy) = (sx / BALL, sy / BALL);
         let q2 = qx * qx + qy * qy;
         let g = rad / (1. - q2).sqrt();
         let (a, b) = (qx * g, qy * g);
         let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
         let k = rad / (r_pic * (1. - q2));
         let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
-        let sphere = (qx, qy, (1. - q2).sqrt());
-        let c = shade(x, y, &v, k, look, sphere, hair).0;
-        // The bezel's shadow: on the side toward the lamp the bezel's wall shades the picture's edge, over about 2⁻³ of the picture's radius.
-        let toward = positive_part(qx * lh.0 + qy * lh.1);
-        let edge = 1. - q2.sqrt();
-        let shadow = 1. - 0.75 * toward * (-(edge * 8.) * (edge * 8.)).exp2();
-        // The glass dome, flatter than the ball (half its curve): a sharp highlight and a broad soft one, added as a screen blend.
-        let nh = facing(unit3((qx * 0.5, qy * 0.5, 1.)));
-        let spec = 0.5 * nh.powi(1 << 7) + 0.125 * nh.powi(1 << 3);
-        (c.map(|c| c * taper * shadow + spec * (1. - c * taper * shadow)), 1.)
+        let c = shade(x, y, &v, k, look, (qx, qy, (1. - q2).sqrt()), hair).0;
+        (c.map(|c| c * taper), 1.)
     };
-    let (e_out, e_in) = (r * BEZEL_OUT, r * BEZEL_IN);
+    let e_out = r * BALL;
     buf.par_chunks_mut(w)
         .enumerate()
         .map(|(py, row)| {
@@ -1338,8 +1292,8 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
                     row[px] = 0;
                     continue;
                 }
-                // Across one of the bezel's edges: at least 2³ samples.
-                let least = if (d - e_out).abs() < 1. || (d - e_in).abs() < 1. { 1 << 3 } else { 2 };
+                // Across the ball's edge: at least 2³ samples.
+                let least = if (d - e_out).abs() < 1. { 1 << 3 } else { 2 };
                 // Linear-light sums, premultiplied by coverage, and the coverage's sum.
                 let mut sum = [0f32; 3];
                 let mut cover = 0f32;
