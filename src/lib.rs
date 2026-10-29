@@ -1467,25 +1467,75 @@ fn mirrored(mut v: View, look: &Look) -> View {
     v
 }
 
-/// The fresh mark (attest, a device no identity has attested on yet): the Mandelbrot set itself, antenna up, filling a disc of radius `r` pixels centred at (`cx`, `cy`), in the device's colour from `salt` (the device's own, from its ira).
-/// Inside, each hyperbolic component glows toward its rim: a point's shade is the attracting cycle's contraction per step, u = |λ|^(1/p) (0 at the component's centre, 1 on its edge), lightness 0.12 + 0.6·u⁴ in the device's colour, so the rim meets the glow outside at the same colour. The main cardioid and the period-2 disc have it in closed form (λ = 1 − √(1 − 4c) and 4(c + 1)); every other point iterates 2⁹ steps to settle, then averages ln|2z| over 2⁶ more (the Lyapunov exponent, ln u).
-/// Outside is black, with a glow from the distance estimate shaped as ferros's circles glow (`render_button`): full at the set, down by the same step every octave of distance, gone 1/GLOW_FRACTION of `r` out.
+/// The fresh mark (attest, a device no identity has attested on yet): the Mandelbrot set itself, antenna up, filling a disc of radius `r` pixels centred at (`cx`, `cy`), in the device's colour, with the device's own Julia set inside every hyperbolic component; everything from `salt` (the device's own, from its ira).
+/// Outside is black, with a glow from the distance estimate shaped as ferros's circles glow (`render_button`): the set's line at full light, a halo at half, down by the same step every octave of distance, gone 1/GLOW_FRACTION of `r` out.
+/// Inside, a component is a disc to its multiplier λ (the attracting cycle's (fᵖ)′, a conformal map of the component onto the unit disc, 0 at its centre and of size 1 on its rim): the main cardioid and the period-2 disc have it in closed form (1 − √(1 − 4c) and 4(c + 1)); every other point iterates 2⁹ steps to settle, then finds its cycle (the first return within 2⁻²⁰) and multiplies 2z around it.
+/// The disc shows the device's Julia set (c from the salt by the same descent the attest balls are placed with, its landing point on the set), spherized as the balls are (z = R·λ/√(1 − |λ|²), the Julia plane's infinity on the rim), coloured exactly as the Mandelbrot set is: its line and halo by its own distance estimate (in units of the disc, so every component's copy glows in proportion), its inside by its contraction.
+/// Toward the rim the Julia picture gives way to the rim's own shade (lightness 0.12 + 0.6·u⁴ for u = |λ|^(1/p), the cycle's contraction a step, weighted by u⁸), which meets the line outside at the same colour, so every component's edge blends into the Mandelbrot set's. Where no cycle is found within 2⁶ steps (near a rim, converging slowly) the rim's shade stands alone, from the Lyapunov exponent.
 /// Sampling: a `k` × `k` stratified grid per pixel, averaged in linear light with coverage (the glow is light over the background, coverage its brightness).
 pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], k: u32) {
     let th = Theme::from_bytes(&draw(salt, 1, 0, &[]));
     let aura = soft(&th, 0.72, 0.15, 0., (0., 0.));
+    // The device's Julia set: the descent from x (as `Params::new_placed`, slanted toward the right), its landing point as c, and half the set's half-extent as the spherize's radius, so the set reaches about 0.87 of the way to a component's rim.
+    let (cj, rj) = {
+        let x = -2. + unit(&draw(salt, 16, 0, &[])[0..4]).sqrt() * (X_RIGHT + 2.);
+        let (land, _, _) = descend(x);
+        ((land.0 as f32, land.1 as f32), (j_extent(land) * 0.5) as f32)
+    };
     // The set from Re −2 to 0.4713 and Im ±1.1225, centred on Re −0.764: half its length plus the glow's reach fills the disc.
     let centre = -0.764f32;
     let scale = 1.2357 * (1. + 1. / GLOW_FRACTION) / r;
     let reach = r / GLOW_FRACTION;
     let octaves = (1 << GLOW_OCTAVES_LOG2) as f32;
+    // A distance d past an edge, in units where the glow reaches `reach` and the line is `line_w` wide: the line at full light and the halo at half (the light, coverage over black).
+    // WHY the floor of 2⁻⁸ of the reach: d is exactly 0 where the derivative overflowed (on the set), and log₂ 0 is −∞; the floor holds the glow at full there, 2⁴ times inside where it is already full.
+    let glow = |d: f32, reach: f32, line_w: f32| -> f32 {
+        let u = 1. + ((d + reach * (1. / (1 << 8) as f32)) / reach).log2() / octaves;
+        let line = (-(d / line_w) * (d / line_w)).exp2();
+        line + (1. - line) * 0.5 * (positive_part(1. - u) - positive_part(-u))
+    };
+    // The inside's shade at contraction u.
+    let shade_in = |u: f32| -> [f32; 3] {
+        let u4 = (u * u) * (u * u);
+        soft(&th, 0.12 + 0.6 * u4, 0.15, 0., (0., 0.))
+    };
+    // The Julia picture at a component's λ, opaque (display colour over black): the same line, halo and inside as the Mandelbrot set's, the distance taken back into units of the disc (the spherize stretches the plane by R/(1 − |λ|²) there).
+    let julia = |lam: (f32, f32)| -> [f32; 3] {
+        let l2 = lam.0 * lam.0 + lam.1 * lam.1;
+        let g = rj / (1. - l2).sqrt();
+        let mut z = (lam.0 * g, lam.1 * g);
+        let (mut dm, mut dm_exp, mut lyap) = (1f32, 0i32, 0f32);
+        let settle = 1u32 << 8;
+        for n in 0..settle + (1 << 5) {
+            let r2 = z.0 * z.0 + z.1 * z.1;
+            if r2 > BAIL_SQ_F32 {
+                let rz = r2.sqrt();
+                let d = rz * rz.ln() / dm * (-(dm_exp as f32)).exp2() * (1. - l2) / rj;
+                let light = glow(d, 1. / GLOW_FRACTION, 1. / (GLOW_FRACTION * (1 << 4) as f32));
+                return aura.map(|a| a * light.sqrt());
+            }
+            if n >= settle {
+                lyap += (4. * r2).ln() * 0.5;
+            }
+            dm *= 2. * r2.sqrt();
+            if dm > (1u64 << 63) as f32 * 2. {
+                dm *= 1. / ((1u64 << 63) as f32 * 2.);
+                dm_exp += 64;
+            }
+            z = (z.0 * z.0 - z.1 * z.1 + cj.0, 2. * z.0 * z.1 + cj.1);
+        }
+        shade_in((lyap * (1. / (1 << 5) as f32)).exp())
+    };
+    // A component's point with multiplier λ and contraction u: the Julia picture giving way to the rim's shade by u⁸.
+    let inside = |lam: (f32, f32), u: f32| -> ([f32; 3], f32) {
+        let j = julia(lam);
+        let rim = shade_in(u);
+        let u8 = { let u2 = u * u; let u4 = u2 * u2; u4 * u4 };
+        ([0, 1, 2].map(|i| j[i] + (rim[i] - j[i]) * u8), 1.)
+    };
     // One sample at (dx, dy) pixels from the centre: its colour (display gamma) and coverage. Up the screen is toward Re −2 (the antenna), right is +Im.
     let sample = |dx: f32, dy: f32| -> ([f32; 3], f32) {
         let c = (centre + dy * scale, dx * scale);
-        let inside = |u: f32| -> ([f32; 3], f32) {
-            let u4 = (u * u) * (u * u);
-            (soft(&th, 0.12 + 0.6 * u4, 0.15, 0., (0., 0.)), 1.)
-        };
         // The main cardioid and the period-2 disc, in closed form.
         let (xq, y2) = (c.0 - 0.25, c.1 * c.1);
         let q = xq * xq + y2;
@@ -1495,29 +1545,32 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
             let m = (ax * ax + ay * ay).sqrt();
             let (sx, sy) = (((m + ax) * 0.5).sqrt(), ((m - ax) * 0.5).sqrt());
             let sy = if ay < 0. { -sy } else { sy };
-            let (lx, ly) = (1. - sx, -sy);
-            return inside((lx * lx + ly * ly).sqrt());
+            let lam = (1. - sx, -sy);
+            return inside(lam, (lam.0 * lam.0 + lam.1 * lam.1).sqrt());
         }
         if (c.0 + 1.) * (c.0 + 1.) + y2 < 1. / 16. {
-            let (lx, ly) = (4. * (c.0 + 1.), 4. * c.1);
-            return inside((lx * lx + ly * ly).sqrt().sqrt());
+            let lam = (4. * (c.0 + 1.), 4. * c.1);
+            return inside(lam, (lam.0 * lam.0 + lam.1 * lam.1).sqrt().sqrt());
         }
-        // Everything else iterates: z from 0, its derivative's magnitude (rescaled by 2⁻⁶⁴ past 2⁶⁴, as `orbit`), and after 2⁹ steps the sum of ln|2z|.
+        // Everything else iterates: z from 0 and its derivative's magnitude (rescaled by 2⁻⁶⁴ past 2⁶⁴, as `orbit`); after 2⁹ steps, the cycle's search: the product of 2z since the settled point, the first return to it, and the sum of ln|2z| for the Lyapunov exponent.
         let (mut z, mut dm, mut plus, mut dm_exp, mut lyap) = ((0f32, 0f32), 0f32, 1f32, 0i32, 0f32);
         let settle = 1u32 << 9;
+        let (mut zs, mut lam, mut found) = ((0f32, 0f32), (1f32, 0f32), 0u32);
         for n in 0..settle + (1 << 6) {
             let r2 = z.0 * z.0 + z.1 * z.1;
             if r2 > BAIL_SQ_F32 {
                 let rz = r2.sqrt();
                 let d = rz * rz.ln() / dm * (-(dm_exp as f32)).exp2() / scale;
-                // WHY the floor of 2⁻⁸ of the reach: d is exactly 0 where the derivative overflowed (on the set), and log₂ 0 is −∞; the floor holds the glow at full there, 2⁴ times inside where it is already full.
-                let u = 1. + ((d + reach * (1. / (1 << 8) as f32)) / reach).log2() / octaves;
-                // The set's own line (its filaments and edge, within about a pixel) at full light, the halo around it at half, so the outline stays crisp inside its glow.
-                let line = (-(d * d)).exp2();
-                return (aura, line + (1. - line) * 0.5 * (positive_part(1. - u) - positive_part(-u)));
+                return (aura, glow(d, reach, 1.));
+            }
+            if n == settle {
+                zs = z;
             }
             if n >= settle {
                 lyap += (4. * r2).ln() * 0.5;
+                if found == 0 {
+                    lam = (2. * (lam.0 * z.0 - lam.1 * z.1), 2. * (lam.0 * z.1 + lam.1 * z.0));
+                }
             }
             dm = 2. * r2.sqrt() * dm + plus;
             if dm > (1u64 << 63) as f32 * 2. {
@@ -1527,8 +1580,19 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
                 dm_exp += 64;
             }
             z = (z.0 * z.0 - z.1 * z.1 + c.0, 2. * z.0 * z.1 + c.1);
+            if n >= settle && found == 0 {
+                let (ex, ey) = (z.0 - zs.0, z.1 - zs.1);
+                if ex * ex + ey * ey < 1. / (1u32 << 20) as f32 {
+                    found = n + 1 - settle;
+                }
+            }
         }
-        inside((lyap * (1. / (1 << 6) as f32)).exp())
+        let u = (lyap * (1. / (1 << 6) as f32)).exp();
+        if found > 0 {
+            inside(lam, u)
+        } else {
+            (shade_in(u), 1.)
+        }
     };
     let (x0, x1) = ((cx - r - 1.) as usize, (cx + r + 2.) as usize);
     let (y0, y1) = ((cy - r - 1.) as usize, (cy + r + 2.) as usize);
