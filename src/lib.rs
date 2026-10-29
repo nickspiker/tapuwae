@@ -1127,22 +1127,29 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
             expose(lin).map(|c| c + spec * (1. - c))
         }
     };
-    // The electric flame (attest): arcs where the flame's real or imaginary part, at the device's `arcs` times its own scale, crosses a whole number — the contours that curl off the set as tongues. Each arc is a core (white-hot, 2⁻⁴ of a contour wide) inside a halo (the device's colour, ¼ of one wide, falling off as 1/(1 + x²)), added as light with a screen blend (on a ground dimmed by ⅜, a plasma globe's dark glass), so it brightens without clipping. Like the ripple, it fades in away from the set, where its contours would crowd into noise.
+    // The electric flame (attest): arcs where the flame's real or imaginary part, at the device's `arcs` times its own scale, crosses a whole number — the contours that curl off the set as tongues. Each arc is a core (2⁻⁴ of a contour wide) inside a halo (¼ of one wide, falling off as 1/(1 + x²)), and between them wisps: the same contours at 2² times the density, a thin core 2⁻⁵ wide in the arc's colour, a touch toward white, and no halo.
+    // Chromatic: an arc along one part takes its colour from the other part, the hue swinging up to a third of a turn either side of the theme's as the arc runs, so one arc passes through neighbouring hues; its core is that colour run toward white, hot but not blank.
+    // Added as light with a screen blend (on a ground dimmed by ⅜, a plasma globe's dark glass), so it brightens without clipping. Like the ripple, it fades in away from the set, where its contours would crowd into noise, and the wisps, four times denser, fade in further out.
     let rgb = if look.electric > 0. && escaped {
-        let arc = |x: f32| {
+        let line = |x: f32, core_w: f32| {
             let s = (pi * x).sin();
-            let (c, h) = (s * (1 << 4) as f32, s * 4.);
+            let (c, h) = (s / core_w, s * 4.);
             ((-(c * c)).exp2(), 1. / (1. + h * h))
         };
         let gain = v.attest.arcs;
-        let (c0, h0) = arc(flame.0 * gain);
-        let (c1, h1) = arc(flame.1 * gain);
-        let core = 1. - (1. - c0) * (1. - c1);
-        let halo = 1. - (1. - h0) * (1. - h1);
-        let fade = dist_px * dist_px / (dist_px * dist_px + (1 << 4) as f32) * look.electric;
-        let aura = soft(th, 0.8, 0.15, 0., (0., 0.));
+        let (c0, h0) = line(flame.0 * gain, 1. / (1 << 4) as f32);
+        let (c1, h1) = line(flame.1 * gain, 1. / (1 << 4) as f32);
+        let (w0, _) = line(flame.0 * gain * 4., 1. / (1 << 5) as f32);
+        let (w1, _) = line(flame.1 * gain * 4., 1. / (1 << 5) as f32);
+        let hue = |other: f32| soft(th, 0.7, 0.2, (tau / 3.) * (tau * other * gain * 0.25).sin(), (0., 0.));
+        let (k0, k1) = (hue(flame.1), hue(flame.0));
+        let d2 = dist_px * dist_px;
+        let fade = d2 / (d2 + (1 << 4) as f32) * look.electric;
+        let wisp_fade = d2 / (d2 + (1 << 6) as f32) * look.electric;
         [0, 1, 2].map(|i| {
-            let e = (aura[i] * halo * 0.5 + core * 0.75) * fade;
+            let arc = |k: [f32; 3], c: f32, h: f32| (k[i] * (h * 0.625 + c * 0.5) + c * 0.375) * fade;
+            let wisp = |k: [f32; 3], w: f32| (k[i] * 0.625 + 0.125) * w * wisp_fade;
+            let e = 1. - (1. - arc(k0, c0, h0)) * (1. - arc(k1, c1, h1)) * (1. - wisp(k0, w0)) * (1. - wisp(k1, w1));
             let base = rgb[i] * (1. - 0.375 * look.electric);
             base + e * (1. - base)
         })
