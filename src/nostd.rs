@@ -3,15 +3,9 @@
 
 pub trait F32Math {
     fn sqrt(self) -> f32;
-    fn ln(self) -> f32;
-    fn log2(self) -> f32;
-    fn exp(self) -> f32;
     fn exp2(self) -> f32;
     fn sin(self) -> f32;
     fn cos(self) -> f32;
-    fn sin_cos(self) -> (f32, f32);
-    fn tanh(self) -> f32;
-    fn atan2(self, x: f32) -> f32;
     fn floor(self) -> f32;
     fn powi(self, n: i32) -> f32;
 }
@@ -19,15 +13,6 @@ pub trait F32Math {
 impl F32Math for f32 {
     fn sqrt(self) -> f32 {
         libm::sqrtf(self)
-    }
-    fn ln(self) -> f32 {
-        libm::logf(self)
-    }
-    fn log2(self) -> f32 {
-        libm::log2f(self)
-    }
-    fn exp(self) -> f32 {
-        libm::expf(self)
     }
     fn exp2(self) -> f32 {
         libm::exp2f(self)
@@ -37,15 +22,6 @@ impl F32Math for f32 {
     }
     fn cos(self) -> f32 {
         libm::cosf(self)
-    }
-    fn sin_cos(self) -> (f32, f32) {
-        libm::sincosf(self)
-    }
-    fn tanh(self) -> f32 {
-        libm::tanhf(self)
-    }
-    fn atan2(self, x: f32) -> f32 {
-        libm::atan2f(self, x)
     }
     fn floor(self) -> f32 {
         libm::floorf(self)

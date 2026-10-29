@@ -32,6 +32,8 @@ use core::f64::consts::TAU;
 #[cfg(feature = "std")]
 use rayon::prelude::*;
 
+mod fm;
+use fm::Fast;
 #[cfg(not(feature = "std"))]
 mod nostd;
 #[cfg(not(feature = "std"))]
@@ -186,8 +188,8 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
     // The flame sums and weights.
     let (mut fq, mut fq_w, mut fc, mut fc_w) = ((0f32, 0f32), 0f32, (0f32, 0f32), 0f32);
     // The taper's scale: ln ln of the escape.
-    let lnln_bail = BAIL_SQ_F32.ln().ln();
-    let ln_2ln2 = (2. * 2f32.ln()).ln();
+    let lnln_bail = BAIL_SQ_F32.fln().fln();
+    let ln_2ln2 = (2. * 2f32.fln()).fln();
     let mut dm_exp = 0i32;
     let (mut lv, mut ray, mut ln_turn, mut engraved) = (0f32, 0f32, 0f32, false);
     let finish = |fq: (f32, f32), fq_w: f32, fc: (f32, f32), fc_w: f32| ((fq.0 / fq_w, fq.1 / fq_w), (fc.0 / fc_w, fc.1 / fc_w));
@@ -204,9 +206,9 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
         }
         if !engraved && r2 > ENGRAVE_SQ {
             engraved = true;
-            lv = n as f32 + 1. - (r2.ln() / ENGRAVE_SQ.ln()).log2();
-            ray = z.1.atan2(z.0) * (1. / TAU as f32);
-            ln_turn = dm.ln() + dm_exp as f32 * core::f32::consts::LN_2 - 0.5 * r2.ln();
+            lv = n as f32 + 1. - (r2.fln() / ENGRAVE_SQ.fln()).flog2();
+            ray = z.1.fatan2(z.0) * (1. / TAU as f32);
+            ln_turn = dm.fln() + dm_exp as f32 * core::f32::consts::LN_2 - 0.5 * r2.fln();
         }
         let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
         trap_sq = trap_sq.min(tx * tx + ty * ty);
@@ -214,7 +216,7 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
         // Flames: iter² weights; past |z|² = 4 the z-flame tapers as (1 − ((ln ln |z|² − ln(2 ln 2)) / ln ln bail)²)⁶, which is in [0, 1] there because |z|² > 4 makes ln ln |z|² > ln(2 ln 2).
         let it = (n + 1) as f32;
         let it2 = it * it;
-        let taper = if r2 > 4. { let t = (r2.ln().ln() - ln_2ln2) / lnln_bail; let t = 1. - t * t; let t = t * t; t * t * t } else { 1. };
+        let taper = if r2 > 4. { let t = (r2.fln().fln() - ln_2ln2) / lnln_bail; let t = 1. - t * t; let t = t * t; t * t * t } else { 1. };
         let wq = taper * it2;
         fq_w += wq;
         fq = (fq.0 + z.0 * wq / rz, fq.1 + z.1 * wq / rz);
@@ -882,14 +884,14 @@ fn oklab(l: f32, a: f32, b: f32) -> [f32; 3] {
 #[inline]
 fn soft(th: &Theme, l: f32, sat: f32, dh: f32, tint: (f32, f32)) -> [f32; 3] {
     let (knee, room) = (0.85f32, 0.1f32);
-    let l = if l > knee { knee + room * ((l - knee) / room).tanh() } else { l };
+    let l = if l > knee { knee + room * ((l - knee) / room).ftanh() } else { l };
     let (h, c) = (th.hue + dh, sat * l);
-    let (a, b) = (c * h.cos() + tint.0 * l, c * h.sin() + tint.1 * l);
+    let (a, b) = (c * h.fcos() + tint.0 * l, c * h.fsin() + tint.1 * l);
     let cm = (a * a + b * b).sqrt();
     let (lo, hi) = (0.16 * l, 0.48 * (1. - l));
     let d = 1. / (1 << 6) as f32;
     let cap = 0.5 * (lo + hi - ((lo - hi) * (lo - hi) + d * d).sqrt());
-    let scale = if cm > 0. && cap > 0. { cap * (cm / cap).tanh() / cm } else { 0. };
+    let scale = if cm > 0. && cap > 0. { cap * (cm / cap).ftanh() / cm } else { 0. };
     oklab(l, a * scale, b * scale)
 }
 
@@ -915,7 +917,7 @@ const METALS: [[f32; 3]; 8] = [
 /// A studio around the picture, as a metal sees it: the brightness reflected along `rr` (a unit vector, screen x right, y down, z out), a bright sky above falling smoothly to a dim floor below, and a faint soft-box at the key lamp `l`.
 #[inline]
 fn studio(rr: (f32, f32, f32), l: (f32, f32, f32)) -> f32 {
-    let sky = 0.5 - 0.5 * (3. * rr.1).tanh();
+    let sky = 0.5 - 0.5 * (3. * rr.1).ftanh();
     let lamp = positive_part(rr.0 * l.0 + rr.1 * l.1 + rr.2 * l.2).powi(1 << 5);
     0.0625 + 0.5 * sky + 0.375 * lamp
 }
@@ -931,7 +933,7 @@ fn metal(base: [f32; 3], n: (f32, f32, f32), l: (f32, f32, f32)) -> [f32; 3] {
 /// Linear light to display, through the exposure curve 1 − e^(−c) (C∞, every brightness lands below white, highlights roll off instead of clipping), then gamma 2.
 #[inline]
 fn expose(lin: [f32; 3]) -> [f32; 3] {
-    lin.map(|c| (1. - (-c).exp()).sqrt())
+    lin.map(|c| (1. - (-c).fexp()).sqrt())
 }
 
 /// A unit vector.
@@ -1002,61 +1004,61 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
     let r = (o.x * o.x + o.y * o.y).sqrt();
     let escaped = o.n < MAX_ITER;
     // Smooth iteration count, normalised to the escape: n + 1 − log₂(ln|z|² / ln bail).
-    let nu = if escaped { o.n as f32 + 1. - ((r * r).ln() / BAIL_SQ_F32.ln()).log2() } else { MAX_ITER as f32 };
+    let nu = if escaped { o.n as f32 + 1. - ((r * r).fln() / BAIL_SQ_F32.fln()).flog2() } else { MAX_ITER as f32 };
     let tau = TAU as f32;
     // The flame, as mandelbrot-exploder colours it: (conj(fc) − fq)·ln(smooth count)/2⁴, a complex number.
-    let flame = { let g = nu.ln() * (1. / (1 << 4) as f32); ((o.fc.0 - o.fq.0) * g, (-o.fc.1 - o.fq.1) * g) };
+    let flame = { let g = nu.fln() * (1. / (1 << 4) as f32); ((o.fc.0 - o.fq.0) * g, (-o.fc.1 - o.fq.1) * g) };
     // The potential's gradient direction (u = z/(dz/dz₀)) in turns: continuous everywhere in the field. The angle of z itself is not usable at a fixed radius (it jumps at every level line, banding the field) nor at the far escape (it turns 2ⁿ times faster and aliases).
-    let gangle = o.uy.atan2(o.ux) / tau;
+    let gangle = o.uy.fatan2(o.ux) / tau;
     // Every method carries the flame on top (the owner likes the look, 2026-10-29); the fourth is the flame alone.
     let (re, im) = match v.mode {
         0 => (nu * (1. / (1 << 4) as f32) + flame.0, gangle + flame.1),
         // The potential's gradient direction, turned by the smooth count: a continuous swirl around the set.
         1 => (gangle + nu * (1. / (1 << 5) as f32) + flame.0, gangle + flame.1),
         // How close the orbit came to the trap, on a log scale: rings and petals around each preimage of the trap.
-        2 => (-(o.trap_sq.ln()) * (1. / (1 << 3) as f32) + flame.0, gangle + flame.1),
+        2 => (-(o.trap_sq.fln()) * (1. / (1 << 3) as f32) + flame.0, gangle + flame.1),
         // The flame itself: its real part along the colouring, its imaginary part breathing.
         _ => (flame.0, flame.1),
     };
     let (re, im) = (re + look.offset.0 + v.keyed.offset.0, im + look.offset.1 + v.keyed.offset.1);
-    let swing = (tau * re).sin();
+    let swing = (tau * re).fsin();
     // Distance to the set: the real distance estimate, |z|·ln|z| / |dz/dz₀|, in plane units and in pixels (0 on it).
-    let dist = if escaped { r * r.ln() / o.dm * (-(o.dm_exp as f32)).exp2() } else { 0. };
+    let dist = if escaped { r * r.fln() / o.dm * (-(o.dm_exp as f32)).fexp2() } else { 0. };
     let dist_px = dist / k;
     // Distance contours: the theme's ripple, four waves across log₂ of the distance from the set, the field's own topography, their phases nudged by the key.
     // Near the set a wave of f turns per doubling has f/(d·ln 2) contours per pixel at d pixels out and would alias into hatching, so it fades in as d²/(d² + (4f/ln 2)²): gone within a few pixels of the set, full once its contours are over 4 pixels apart.
     let crowd = 4. / core::f32::consts::LN_2;
     // The faster a wave, the more closely its contours crowd near the set, so each fades in by its own frequency: d²/(d² + (crowd·f)²).
-    let ld = dist.log2();
+    let ld = dist.flog2();
     let th0 = &v.theme;
     let wave = |k: usize| {
         let f = th0.ripple_f[k];
         let fade = dist_px * dist_px / (dist_px * dist_px + (crowd * f) * (crowd * f));
-        th0.ripple_a[k] * (tau * (f * ld + v.keyed.phase[k])).sin() * fade
+        th0.ripple_a[k] * (tau * (f * ld + v.keyed.phase[k])).fsin() * fade
     };
     let (rl, ra, rb) = if escaped { (wave(0) + wave(1), wave(2), wave(3)) } else { (0., 0., 0.) };
     // The soft flame (every look): along the flame's contours at 2² times its own scale, a gentle lightness wave (2⁻⁴ either way, from its imaginary part) and a hue wave (¼ rad either way, from its real part), so its tongues read in the open field in the theme's own tones; it fades in away from the set by its contours' crowding, as the ripple's waves do.
     let (flame_l, flame_h) = if escaped {
         let fade = dist_px * dist_px / (dist_px * dist_px + (1 << 4) as f32);
-        ((tau * 4. * flame.1).sin() * (1. / (1 << 4) as f32) * fade, (tau * 4. * flame.0).sin() * 0.25 * fade)
+        ((tau * 4. * flame.1).fsin() * (1. / (1 << 4) as f32) * fade, (tau * 4. * flame.0).fsin() * 0.25 * fade)
     } else {
         (0., 0.)
     };
-    let breathe = (tau * im).cos() * (1. / (1 << 6) as f32) + rl + flame_l;
+    let breathe = (tau * im).fcos() * (1. / (1 << 6) as f32) + rl + flame_l;
     // Body: within about a pixel of the set, falling smoothly (C∞) to nothing a few pixels out.
     let body = 1. / (1. + dist_px * dist_px);
     // Rim: strongest about 2¹ pixels out, a smooth bump in log distance.
-    let ll = (dist_px + 1. / (1 << 4) as f32).log2() - 1.;
-    let rim = (-(ll * ll)).exp2();
+    let ll = (dist_px + 1. / (1 << 4) as f32).flog2() - 1.;
+    let rim = (-(ll * ll)).fexp2();
     // Far: how far out in the field, 0 near the set to 1 far away (the disc's own rim, the plane's infinity, is fully far).
-    let far = (-nu * 0.125).exp2();
+    let far = (-nu * 0.125).fexp2();
     let th = &v.theme;
     let fixed = Lighting::fixed();
     let lt = if look.fixed_light { &fixed } else { &th.lighting };
     // The surface's tilt from the slope (the parameter plane has no u, so it lights flat).
     let sr = lt.relief * look.relief * v.keyed.relief;
     // The key's turn of the lamps, applied with the view's own.
-    let turn = (TAU as f32 * v.keyed.light_turn).sin_cos();
+    let turn = (TAU as f32 * v.keyed.light_turn).fsin_cos();
     let lrot = (v.rot.0 * turn.1 - v.rot.1 * turn.0, v.rot.0 * turn.0 + v.rot.1 * turn.1);
     let hyp = (sr * sr + dist_px * dist_px).sqrt();
     let (sin_a, cos_a) = (sr / hyp, dist_px / hyp);
@@ -1093,15 +1095,15 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
     let pi = core::f32::consts::PI;
     let (m_lv, n_ray) = (v.attest.levels, v.attest.rays);
     let lv_px = m_lv / (core::f32::consts::LN_2 * dist_px);
-    let ray_px = n_ray * o.ln_turn.exp() * k / tau;
+    let ray_px = n_ray * o.ln_turn.fexp() * k / tau;
     let apart = |per_px: f32| {
         let s = 1. / per_px;
         let crowd = 8. * hair;
         s * s / (s * s + crowd * crowd)
     };
     let ink = |x: f32, per_px: f32| {
-        let d = (pi * x).sin() / (pi * per_px * hair);
-        (-(d * d)).exp2() * apart(per_px)
+        let d = (pi * x).fsin() / (pi * per_px * hair);
+        (-(d * d)).fexp2() * apart(per_px)
     };
     let line = if escaped {
         let levels = if engrave & 1 == 1 { ink(o.lv * m_lv, lv_px) } else { 0. };
@@ -1182,16 +1184,16 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
     // Added as light with a screen blend (on a ground dimmed by ⅜, a plasma globe's dark glass), so it brightens without clipping. Like the ripple, it fades in away from the set, where its contours would crowd into noise, and the wisps, four times denser, fade in further out.
     let rgb = if look.electric > 0. && escaped {
         let line = |x: f32, core_w: f32| {
-            let s = (pi * x).sin();
+            let s = (pi * x).fsin();
             let (c, h) = (s / core_w, s * 4.);
-            ((-(c * c)).exp2(), 1. / (1. + h * h))
+            ((-(c * c)).fexp2(), 1. / (1. + h * h))
         };
         let gain = v.attest.arcs;
         let (c0, h0) = line(flame.0 * gain, 1. / (1 << 4) as f32);
         let (c1, h1) = line(flame.1 * gain, 1. / (1 << 4) as f32);
         let (w0, _) = line(flame.0 * gain * 4., 1. / (1 << 5) as f32);
         let (w1, _) = line(flame.1 * gain * 4., 1. / (1 << 5) as f32);
-        let hue = |other: f32| soft(th, 0.7, 0.2, (tau / 3.) * (tau * other * gain * 0.25).sin(), (0., 0.));
+        let hue = |other: f32| soft(th, 0.7, 0.2, (tau / 3.) * (tau * other * gain * 0.25).fsin(), (0., 0.));
         let (k0, k1) = (hue(flame.1), hue(flame.0));
         let d2 = dist_px * dist_px;
         let fade = d2 / (d2 + (1 << 4) as f32) * look.electric;
@@ -1358,7 +1360,7 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
         let q2 = s2 / b2;
         if q2 > 1. {
             // q2 > 1 means s2 > b2 exactly, so the log is finite. u: 0 at q_end/2⁴ (full light holds inside it), 1 at q_end; the light 1 − u between, softly 1 before and 0 after.
-            let u = 1. + (s2 - b2).log2() / octaves - q_end.log2() / octaves;
+            let u = 1. + (s2 - b2).flog2() / octaves - q_end.flog2() / octaves;
             let light = (positive_part(1. - u) - positive_part(-u)) * (1. - s2.powi(1 << 3));
             return (aura, light);
         }
@@ -1496,8 +1498,8 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
     // A distance d (pixels) past the set's edge: its line at full light and the halo at half (the light, coverage over black).
     // WHY the floor of 2⁻⁸ of the reach: d is exactly 0 where the derivative overflowed (on the set), and log₂ 0 is −∞; the floor holds the glow at full there, 2⁴ times inside where it is already full.
     let glow = |d: f32| -> f32 {
-        let u = 1. + ((d + reach * (1. / (1 << 8) as f32)) / reach).log2() / octaves;
-        let line = (-(d * d)).exp2();
+        let u = 1. + ((d + reach * (1. / (1 << 8) as f32)) / reach).flog2() / octaves;
+        let line = (-(d * d)).fexp2();
         line + (1. - line) * 0.5 * (positive_part(1. - u) - positive_part(-u))
     };
     // A component's cell from λ and its radius in pixels: λ as the ball's disc point (Im λ, Re λ), so in the main cardioid, where λ ≈ 2c near its centre, the ball stands as the screen does (right is +Im, down is +Re).
@@ -1507,7 +1509,7 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
         let qx = (lam.1 * q15).max(-top).min(top);
         let qy = (lam.0 * q15).max(-top).min(top);
         // WHY the floor on ρ: at the cardioid's cusp (c = ¼ exactly) the radius is 0 and log₂ 0 = −∞, which as an i16 would read as OUTSIDE; one above RIM is a radius of 2⁻¹²⁸, all rim.
-        [qx as i16, qy as i16, (r_pic.log2() * (1 << 8) as f32).max(RIM as f32 + 1.) as i16]
+        [qx as i16, qy as i16, (r_pic.flog2() * (1 << 8) as f32).max(RIM as f32 + 1.) as i16]
     };
     // A point of the parameter plane: escaped (its distance in pixels), inside a component found (λ), or neither within the search.
     enum Pt {
@@ -1523,7 +1525,7 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
             let r2 = z.0 * z.0 + z.1 * z.1;
             if r2 > BAIL_SQ_F32 {
                 let rz = r2.sqrt();
-                return Pt::Out(rz * rz.ln() / dm * (-(dm_exp as f32)).exp2() / scale);
+                return Pt::Out(rz * rz.fln() / dm * (-(dm_exp as f32)).fexp2() / scale);
             }
             if n == settle {
                 zs = z;
@@ -1585,7 +1587,7 @@ pub fn render_fresh(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, salt: &
             RIM => (aura, 1., true),
             rho => {
                 let p = (cl[0] as f32 / q15, cl[1] as f32 / q15);
-                let r_pic = (rho as f32 * (1. / (1 << 8) as f32)).exp2();
+                let r_pic = (rho as f32 * (1. / (1 << 8) as f32)).fexp2();
                 let q2 = p.0 * p.0 + p.1 * p.1;
                 let g = rad / (1. - q2).sqrt();
                 let (a, b) = (p.0 * g, p.1 * g);
@@ -1745,7 +1747,7 @@ mod tests {
         }
     }
 
-    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the soft flame joined every colouring method and the escape moved to 2⁶² (2026-10-29) (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
+    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the render took its own maths (fm, 2026-10-29: a step of one 8-bit level on a few pixels; the same on every platform from here) (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
     #[test]
     fn avatars_hold_still() {
         let mut h = blake3::Hasher::new();
@@ -1759,7 +1761,7 @@ mod tests {
                 h.update(&p.to_le_bytes());
             }
         }
-        assert_eq!(h.finalize().to_hex().as_str(), "897e69498fc4ad607fef075cdc7adf3d5f46fb661c1bdf588a0f978e0567602a");
+        assert_eq!(h.finalize().to_hex().as_str(), "71fa896f4f79becbd5c82f4951722c978df4d4a75b5c09a9c4cabf403b4705fa");
     }
 
     /// A spiral's eye really is periodic: f^p carries it back onto itself.
