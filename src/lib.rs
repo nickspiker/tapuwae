@@ -953,12 +953,13 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, sphere: (f32, f32, f32),
     let flame = { let g = nu.ln() * (1. / (1 << 4) as f32); ((o.fc.0 - o.fq.0) * g, (-o.fc.1 - o.fq.1) * g) };
     // The potential's gradient direction (u = z/(dz/dz₀)) in turns: continuous everywhere in the field. The angle of z itself is not usable at a fixed radius (it jumps at every level line, banding the field) nor at the far escape (it turns 2ⁿ times faster and aliases).
     let gangle = o.uy.atan2(o.ux) / tau;
+    // Every method carries the flame on top (the owner likes the look, 2026-10-29); the fourth is the flame alone.
     let (re, im) = match v.mode {
-        0 => (nu * (1. / (1 << 4) as f32), gangle),
+        0 => (nu * (1. / (1 << 4) as f32) + flame.0, gangle + flame.1),
         // The potential's gradient direction, turned by the smooth count: a continuous swirl around the set.
-        1 => (gangle + nu * (1. / (1 << 5) as f32), gangle),
+        1 => (gangle + nu * (1. / (1 << 5) as f32) + flame.0, gangle + flame.1),
         // How close the orbit came to the trap, on a log scale: rings and petals around each preimage of the trap.
-        2 => (-(o.trap_sq.ln()) * (1. / (1 << 3) as f32), gangle),
+        2 => (-(o.trap_sq.ln()) * (1. / (1 << 3) as f32) + flame.0, gangle + flame.1),
         // The flame itself: its real part along the colouring, its imaginary part breathing.
         _ => (flame.0, flame.1),
     };
@@ -1234,27 +1235,26 @@ pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, 
         .reduce(|| vec![0u64; MAX_SAMPLES + 1], |a, b| a.iter().zip(&b).map(|(x, y)| x + y).collect())
 }
 
-/// The button's ball: its edge at 2⁻³ in from the disc's, the drop shadow filling the rest.
-const BALL: f32 = 1. - 1. / (1 << 3) as f32;
+/// How far the button's glow reaches past the ball's edge, as a fraction of its radius: 1/12, as ferros's circles glow (payloads/display, `GLOW_FRACTION`, owner 2026-10-24); and its fade, 2^GLOW_OCTAVES_LOG2 octaves of squared distance from full light to none (four, as `GLOW_OCT_LOG2`).
+const GLOW_FRACTION: f32 = 12.;
+const GLOW_OCTAVES_LOG2: i32 = 2;
 
-/// The logistic 1/(1 + e^(−x)), C∞.
-#[inline]
-fn logistic(x: f32) -> f32 {
-    1. / (1. + (-x).exp())
-}
+/// The button's ball, as a fraction of the disc's radius: small enough that its glow ends exactly at the disc's edge, BALL·(1 + 1/GLOW_FRACTION) = 1.
+const BALL: f32 = GLOW_FRACTION / (GLOW_FRACTION + 1.);
 
-/// The mark as a round button (attest), in a disc of radius `r` pixels centred at (`cx`, `cy`): the picture as a ball, spherized as `render_disc` does, over a drop shadow cast down and away from the key lamp out to the disc's own edge (where it has faded to nothing, smoothly, as 1 − s¹⁶). No rim, no glass: what shine there is comes from the set's own slope (see `shade`).
-/// The ball is opaque and the shadow is not, so samples are averaged with their coverage (premultiplied, in linear light); pixels across the ball's edge take at least 2³ samples, since a sharp circle can fall between two jittered samples on one side.
+/// The mark as a round button (attest), in a disc of radius `r` pixels centred at (`cx`, `cy`): the picture as a ball, spherized as `render_disc` does, its rim tapering (by the look's vignette) into the device's own colour instead of to black, and that colour glowing on past the edge as ferros's circles glow (`draw::glow_log`): full at the edge, down by the same step every octave of q = s² − BALL² (the squared distance past it), gone 1/GLOW_FRACTION of the radius out, which is the disc's edge. The glow's ends are soft (`positive_part`), not clipped, and it is held to nothing at the disc's edge by 1 − s¹⁶. No rim, no glass: what shine there is comes from the set's own slope (see `shade`).
+/// The colour is the theme's hue at lightness 0.72, as saturated as the soft scheme allows.
+/// The ball is opaque and the glow is light over the background (coverage = its brightness), so samples are averaged with their coverage (premultiplied, in linear light); pixels across the ball's edge take at least 2³ samples, since a sharp circle can fall between two jittered samples on one side.
 fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) -> Vec<u64> {
     let v = mirrored(p.view(), look);
     let r_pic = r * BALL;
     let hair = r_pic * (1. / (1 << 7) as f32);
     let rad = p.radius as f32;
-    let fixed = Lighting::fixed();
-    let lt = if look.fixed_light { &fixed } else { &v.theme.lighting };
-    let turn = (TAU as f32 * v.keyed.light_turn).sin_cos();
-    let l = { let d = lt.key.dir; (d.0 * turn.1 - d.1 * turn.0, d.0 * turn.0 + d.1 * turn.1, d.2) };
-    let lh = { let m = (l.0 * l.0 + l.1 * l.1).sqrt(); (l.0 / m, l.1 / m) };
+    let aura = soft(&v.theme, 0.72, 0.15, 0., (0., 0.));
+    let b2 = BALL * BALL;
+    // Where the glow ends (the disc's edge) in q, and how many octaves of q it fades over.
+    let q_end = 1. - b2;
+    let octaves = (1 << GLOW_OCTAVES_LOG2) as f32;
     // One sample at (dx, dy) pixels from the centre: its colour (display gamma) and its coverage.
     let sample = |dx: f32, dy: f32| -> ([f32; 3], f32) {
         let (sx, sy) = (dx / r, dy / r);
@@ -1262,13 +1262,11 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
         if s2 >= 1. {
             return ([0.; 3], 0.);
         }
-        if s2 >= BALL * BALL {
-            // The drop shadow: a disc the ball's size, moved half the margin away from the lamp, its edge softened over about 2⁻⁵ of the radius.
-            let off = (1. - BALL) * 0.5;
-            let (ox, oy) = (sx + lh.0 * off, sy + lh.1 * off);
-            let so = (ox * ox + oy * oy).sqrt();
-            let a = 0.5 * logistic((BALL - so) * (1 << 5) as f32) * (1. - s2.powi(1 << 3));
-            return ([0.; 3], a);
+        if s2 >= b2 {
+            // u: 0 at q_end/2⁴ (full light holds inside it), 1 at q_end; the light 1 − u between, softly 1 before and 0 after.
+            let u = 1. + (s2 - b2).log2() / octaves - q_end.log2() / octaves;
+            let light = (positive_part(1. - u) - positive_part(-u)) * (1. - s2.powi(1 << 3));
+            return (aura, light);
         }
         let (qx, qy) = (sx / BALL, sy / BALL);
         let q2 = qx * qx + qy * qy;
@@ -1278,7 +1276,7 @@ fn render_button(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params
         let k = rad / (r_pic * (1. - q2));
         let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
         let c = shade(x, y, &v, k, look, (qx, qy, (1. - q2).sqrt()), hair).0;
-        (c.map(|c| c * taper), 1.)
+        ([0, 1, 2].map(|i| aura[i] + (c[i] - aura[i]) * taper), 1.)
     };
     let e_out = r * BALL;
     buf.par_chunks_mut(w)
@@ -1433,7 +1431,7 @@ mod tests {
         }
     }
 
-    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew when the attest features arrived (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
+    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the flame joined every colouring method (2026-10-29, owner-approved) (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
     #[test]
     fn avatars_hold_still() {
         let mut h = blake3::Hasher::new();
@@ -1447,7 +1445,7 @@ mod tests {
                 h.update(&p.to_le_bytes());
             }
         }
-        assert_eq!(h.finalize().to_hex().as_str(), "e8ec4f4cab5a2dc99d69f0a963b149876f3da2b3a9d02fc1faafbc163c976de0");
+        assert_eq!(h.finalize().to_hex().as_str(), "dc2881e43958d72c5969440a0f8bb1491685197f0856c8f6a002387546b73d4d");
     }
 
     /// A spiral's eye really is periodic: f^p carries it back onto itself.
