@@ -1551,9 +1551,13 @@ const OUTSIDE: i16 = i16::MIN;
 const RIM: i16 = i16::MIN + 1;
 /// A fine cell not worked out yet: the full pass sets them, the first fine pass to reach one works it out.
 const UNSET: i16 = i16::MIN + 2;
+/// Where the fresh mark's glow is cut, as log₂ of the smoothed escape count: 27/8, whose contour lies 1/GLOW_FRACTION of the disc's radius from the set (measured over a 900 px disc, 2026-10-29: the contour's distance from the set is 0.98 of that at the median, 0.54 to 1.34 from the tenth to the ninetieth percentile; at 3.25 the median is 1.55, at 3.5 it is 0.60).
+const FRESH_GLOW_FLOOR_LOG2: f32 = 27. / 8.;
+/// How much smaller than the old fit the fresh mark's set is drawn, so the cutoff's contour stays inside the disc: 1 + 2⁻⁵ (the contour reached 1.026 of the radius at the old fit, 2026-10-29; now about 0.995).
+const FRESH_SHRINK: f32 = 1. + 1. / (1 << 5) as f32;
 
 /// The fresh mark (attest, a device no identity has attested on yet): the Mandelbrot set itself, antenna up, filling a disc of radius `r` pixels centred at (`cx`, `cy`), in the device's colour, with the device's attest ball inside every hyperbolic component; everything from `salt` (the device's own, from its ira), and the ball also from `text`, the textbox, as the attest ball follows it (each character nudging it, `Params::new`).
-/// Outside is black, with a glow from the distance estimate shaped as ferros's circles glow (`render_button`): the set's line at full light, a halo at half, down by the same step every octave of distance, gone 1/GLOW_FRACTION of `r` out. It never depends on the text.
+/// Outside is black, with a glow from the binary log of the smoothed escape count (owner, 2026-10-29, in place of the distance estimate): ν = n + 1 − log₂(ln|z|² / ln B²), as the avatars smooth theirs, and its light rises linearly in log₂ ν from the cutoff FRESH_GLOW_FLOOR_LOG2 to full at the search's own end (2⁹ + 2⁶ steps), black below the cutoff (a straight clip for now; a curve down to black may come). The cutoff's contour lies about 1/GLOW_FRACTION of `r` out from the set, as ferros's circles glow, and the set is drawn a little smaller to keep it inside the disc. It never depends on the text.
 /// Inside, a component is a disc to its multiplier λ (the attracting cycle's (fᵖ)′, a conformal map of the component onto the unit disc, 0 at its centre and of size 1 on its rim): the main cardioid and the period-2 disc have it in closed form (1 − √(1 − 4c) and 4(c + 1)); every other point iterates 2⁹ steps to settle, then finds its cycle (the first return within 2⁻²⁰) and multiplies 2z around it.
 /// The disc is the attest ball's disc, point for point: the same view and `shade`, in `look` (the device passes `Look::fresh()`: the attest ball's style, material, engraving, mirror and electric flame, tapering into the device's colour at the rim by √(1 − |p|²) rather than the button's twelfth power); that colour is the set's line outside, so every component blends into the outline. The ball's scale in pixels is the component's: its radius is 1/|dλ/dpixel| (in closed form for the cardioid and the period-2 disc, |λ′| = 2/|√(1 − 4c)| and 4; elsewhere λ again half a pixel along and the difference), and its lines are 2⁻⁷ of that, as the ball's are of its own.
 /// Where no cycle is found within 2⁶ steps (right at a rim, converging slowly, or a period past 2⁶) the device's colour stands, as the ball's rim does.
@@ -1567,19 +1571,15 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
     let params = Params::new(salt, text);
     let v = mirrored(params.view(), look);
     let rad = params.radius as f32;
-    // The set from Re −2 to 0.4713 and Im ±1.1225, centred on Re −0.764: half its length plus the glow's reach fills the disc.
+    // The set from Re −2 to 0.4713 and Im ±1.1225, centred on Re −0.764: half its length plus the glow's reach fills the disc, a smidge smaller (FRESH_SHRINK) so the glow's cutoff fits inside.
     let centre = -0.764f32;
-    let scale = 1.2357 * (1. + 1. / GLOW_FRACTION) / r;
-    let reach = r / GLOW_FRACTION;
-    let octaves = (1 << GLOW_OCTAVES_LOG2) as f32;
+    let scale = 1.2357 * (1. + 1. / GLOW_FRACTION) * FRESH_SHRINK / r;
     let q15 = (1u32 << 15) as f32;
-    // A distance d (pixels) past the set's edge: its line at full light and the halo at half (the light, coverage over black).
-    // WHY the floor of 2⁻⁸ of the reach: d is exactly 0 where the derivative overflowed (on the set), and log₂ 0 is −∞; the floor holds the glow at full there, 2⁴ times inside where it is already full.
-    let glow = |d: f32| -> f32 {
-        let u = 1. + ((d + reach * (1. / (1 << 8) as f32)) / reach).flog2() / octaves;
-        let line = (-(d * d)).fexp2();
-        line + (1. - line) * 0.5 * (positive_part(1. - u) - positive_part(-u))
-    };
+    let settle = 1u32 << 9;
+    // The glow at log₂ ν = `g` (the light, coverage over black): linear in g from the cutoff to the search's end, the last escape there is (ν ≤ 2⁹ + 2⁶), so full light is reached only beside the set; black below the cutoff.
+    // ν > 1 always (no point escapes before its second step: |c| < 2³¹ here), so g > 0 and no log is of 0.
+    let top = ((settle + (1 << 6)) as f32).flog2();
+    let glow = |g: f32| -> f32 { positive_part(g - FRESH_GLOW_FLOOR_LOG2) / (top - FRESH_GLOW_FLOOR_LOG2) };
     // A component's cell from λ and its radius in pixels: λ as the ball's disc point (Im λ, Re λ), so in the main cardioid, where λ ≈ 2c near its centre, the ball stands as the screen does (right is +Im, down is +Re).
     // WHY the bound on |p|, as a length: λ within a rounding of a rim can come out at or past 1, outside the ball, where its √(1 − |p|²) is NaN (a white speck, about 20 to a 600 px mark when each coordinate was held on its own, 2026-10-29, since the diagonals still passed 1); scaled back to |p| = 1 − 2⁻¹⁵ it is the rim's colour either way, |p|² stays below 1, and neither i16 can reach ±2¹⁵.
     // `ang` (turns) is arg λ′, λ′ = dλ/dc: how far the component's ball stands turned on the glass. Screen to c swaps the axes, c to λ is holomorphic and λ to the disc point swaps them back, each swap i·conj, so screen to disc point is multiplication by conj(λ′)·scale: the picture keeps that turn (owner, 2026-10-29: the set inside a component stands as λ puts it) and only the lamps are turned to match (`ball`), so they shine from the top left of the screen in every component. The cardioid and the period-2 disc have it in closed form (λ′ = 2/√(1 − 4c), and 4); every other component takes it from the step it measures its size by.
@@ -1592,34 +1592,25 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
         // The angle in 16-bit turns, wrapped (an i32 cut to its low 16 bits).
         [qx as i16, qy as i16, (r_pic.flog2() * (1 << 8) as f32).max(UNSET as f32 + 1.) as i16, (ang * (1u32 << 16) as f32) as i32 as i16]
     };
-    // A point of the parameter plane: escaped (its distance in pixels), inside a component found (λ), or neither within the search.
+    // A point of the parameter plane: escaped (log₂ of its smoothed escape count), inside a component found (λ), or neither within the search.
     enum Pt {
         Out(f32),
         In((f32, f32)),
         Slow,
     }
     let probe = |c: (f32, f32)| -> Pt {
-        let (mut z, mut dm, mut plus, mut dm_exp) = ((0f32, 0f32), 0f32, 1f32, 0i32);
-        let settle = 1u32 << 9;
+        let mut z = (0f32, 0f32);
         let (mut zs, mut lam) = ((0f32, 0f32), (1f32, 0f32));
         for n in 0..settle + (1 << 6) {
             let r2 = z.0 * z.0 + z.1 * z.1;
             if r2 > BAIL_SQ_F32 {
-                let rz = r2.sqrt();
-                return Pt::Out(rz * rz.fln() / dm * (-(dm_exp as f32)).fexp2() / scale);
+                return Pt::Out((n as f32 + 1. - (r2.fln() / BAIL_SQ_F32.fln()).flog2()).flog2());
             }
             if n == settle {
                 zs = z;
             }
             if n >= settle {
                 lam = (2. * (lam.0 * z.0 - lam.1 * z.1), 2. * (lam.0 * z.1 + lam.1 * z.0));
-            }
-            dm = 2. * r2.sqrt() * dm + plus;
-            if dm > (1u64 << 63) as f32 * 2. {
-                let s = 1. / ((1u64 << 63) as f32 * 2.);
-                dm *= s;
-                plus *= s;
-                dm_exp += 64;
             }
             z = (z.0 * z.0 - z.1 * z.1 + c.0, 2. * z.0 * z.1 + c.1);
             if n >= settle {
@@ -1649,7 +1640,7 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
             return comp((4. * (c.0 + 1.), 4. * c.1), 1. / (4. * scale), 0.);
         }
         match probe(c) {
-            Pt::Out(d) => [(glow(d) * (q15 - 1.)) as i16, 0, OUTSIDE, 0],
+            Pt::Out(g) => [(glow(g) * (q15 - 1.)) as i16, 0, OUTSIDE, 0],
             Pt::In(lam) => match probe((c.0 + scale * 0.5, c.1)) {
                 // λ half a pixel along +Re c: |dλ/dpixel| = 2·|λ₂ − λ|, and λ₂ − λ points along λ′ (the step in c is real).
                 Pt::In(l2) => {
@@ -1703,7 +1694,7 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
         for px in x0..x1 {
             let i = py * w + px;
             // The pixel's centre cell: worked out by the full pass (which keeps it, and sets the pixel's fine cells to be worked out by the first fine pass that reaches them), read back by every other.
-            // Only the components are anti-aliased (owner, 2026-10-29): the outline and its halo come from the distance estimate, smooth in pixels already, so a pixel whose centre falls outside takes that one sample and keeps no map entries. A component's rim and the line outside it are the same colour, so where a pixel's centre misses a rim it covers, nothing shows.
+            // Only the components are anti-aliased (owner, 2026-10-29): the glow outside comes from the smoothed escape count, smooth in pixels already, so a pixel whose centre falls outside takes that one sample and keeps no map entries. A component's rim and the line outside it are the same colour, so where a pixel's centre misses a rim it covers, nothing shows.
             let centre_cell = if full {
                 let cc = cell(px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
                 if cc[2] == OUTSIDE {
