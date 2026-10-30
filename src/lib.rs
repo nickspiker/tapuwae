@@ -1015,6 +1015,11 @@ impl Look {
     pub fn attest() -> Self {
         Look { vignette: 12, material: Pick::Device, engrave: Pick::Device, mirror: Pick::Device, style: Pick::Device, button: true, electric: 1., ..Look::default() }
     }
+
+    /// The ball inside the fresh mark's components (`render_fresh`, a device no identity has attested on yet): the attest ball, but tapering into the device's colour by √(1 − |p|²) (owner, 2026-10-29): in a component it reads as a lit sphere glowing into the outline, not a button; the bound identity's mark keeps √(1 − |p|¹²).
+    pub fn fresh() -> Self {
+        Look { vignette: 2, ..Look::attest() }
+    }
 }
 
 /// A lamp's direction in the plane: its horizontal part turned by the view's `rot` (plane = centre + rot·screen), its height unchanged.
@@ -1550,19 +1555,17 @@ const UNSET: i16 = i16::MIN + 2;
 /// The fresh mark (attest, a device no identity has attested on yet): the Mandelbrot set itself, antenna up, filling a disc of radius `r` pixels centred at (`cx`, `cy`), in the device's colour, with the device's attest ball inside every hyperbolic component; everything from `salt` (the device's own, from its ira), and the ball also from `text`, the textbox, as the attest ball follows it (each character nudging it, `Params::new`).
 /// Outside is black, with a glow from the distance estimate shaped as ferros's circles glow (`render_button`): the set's line at full light, a halo at half, down by the same step every octave of distance, gone 1/GLOW_FRACTION of `r` out. It never depends on the text.
 /// Inside, a component is a disc to its multiplier λ (the attracting cycle's (fᵖ)′, a conformal map of the component onto the unit disc, 0 at its centre and of size 1 on its rim): the main cardioid and the period-2 disc have it in closed form (1 − √(1 − 4c) and 4(c + 1)); every other point iterates 2⁹ steps to settle, then finds its cycle (the first return within 2⁻²⁰) and multiplies 2z around it.
-/// The disc is the attest ball's disc, point for point: the same view, `shade` and `Look::attest()` (style, material, engraving, mirror, electric flame), tapering into the device's colour at the rim by √(1 − |p|²) rather than the button's twelfth power, which is the colour of the set's line outside, so every component blends into the outline. The ball's scale in pixels is the component's: its radius is 1/|dλ/dpixel| (in closed form for the cardioid and the period-2 disc, |λ′| = 2/|√(1 − 4c)| and 4; elsewhere λ again half a pixel along and the difference), and its lines are 2⁻⁷ of that, as the ball's are of its own.
+/// The disc is the attest ball's disc, point for point: the same view and `shade`, in `look` (the device passes `Look::fresh()`: the attest ball's style, material, engraving, mirror and electric flame, tapering into the device's colour at the rim by √(1 − |p|²) rather than the button's twelfth power); that colour is the set's line outside, so every component blends into the outline. The ball's scale in pixels is the component's: its radius is 1/|dλ/dpixel| (in closed form for the cardioid and the period-2 disc, |λ′| = 2/|√(1 − 4c)| and 4; elsewhere λ again half a pixel along and the difference), and its lines are 2⁻⁷ of that, as the ball's are of its own.
 /// Where no cycle is found within 2⁶ steps (right at a rim, converging slowly, or a period past 2⁶) the device's colour stands, as the ball's rim does.
 /// `inside` is a bitmask of the pixels (one bit per pixel of `buf`, 64 a word, row after row) whose centre falls in a component, and two maps of them, independent: `coarse`, one cell a pixel (its centre), worked out by the full pass; `fine`, k² cells a pixel, set to UNSET by the full pass and worked out by the first fine pass to reach each (so a fine pass stopped part way keeps what it did). With `full` every pixel renders, the mask and the coarse map are written and the fine map reset; without, only the masked pixels render, from the maps, so a new `text` costs the balls' shading alone and leaves the outline as it was. A map too short holds the first pixels' cells; the rest are worked out again each time.
 /// Sampling: one sample at a pixel's centre outside the components; a `k` × `k` stratified grid per pixel that touches one, averaged in linear light with coverage (the glow is light over the background, coverage its brightness), the grid's cells kept in the map.
 /// The pixels are ferros's 16-bit surface pixels (`pack16`): the mark goes to a 16-bit pipeline, so it keeps 14 bits a channel through to the display's dither (owner, 2026-10-29), not a fluor pixel's 8.
 /// Two passes for latency (owner, 2026-10-29): a coarse one (`fine_pass` false) draws each component pixel from its centre cell, a sixteenth of a 4 × 4 fine pass's work, boot included, four pixels to a lane call, to be on the glass at once; a fine one draws all k² cells to clear it up a moment later. `stop` is asked before every row: true leaves the pass where it is and returns false (a newer handle is waiting); a finished pass returns true.
-pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], text: &str, k: u32, inside: &mut [u64], coarse: &mut [FreshCell], fine: &mut [FreshCell], full: bool, fine_pass: bool, stop: &dyn Fn() -> bool) -> bool {
+pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &[u8; 32], text: &str, look: &Look, k: u32, inside: &mut [u64], coarse: &mut [FreshCell], fine: &mut [FreshCell], full: bool, fine_pass: bool, stop: &dyn Fn() -> bool) -> bool {
     let th = Theme::from_bytes(&draw(salt, 1, 0, &[]));
     let aura = soft(&th, 0.72, 0.15, 0., (0., 0.));
-    // The attest ball's look, but tapering into the device's colour by √(1 − |p|²) (owner, 2026-10-29): in a component it reads as a lit sphere glowing into the outline, not a button; the bound identity's mark keeps √(1 − |p|¹²).
-    let look = Look { vignette: 2, ..Look::attest() };
     let params = Params::new(salt, text);
-    let v = mirrored(params.view(), &look);
+    let v = mirrored(params.view(), look);
     let rad = params.radius as f32;
     // The set from Re −2 to 0.4713 and Im ±1.1225, centred on Re −0.764: half its length plus the glow's reach fills the disc.
     let centre = -0.764f32;
@@ -1672,7 +1675,7 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
         let mut at4 = [cs[0]; 4];
         at4[..cs.len()].copy_from_slice(cs);
         let lane = |j: usize| F4(at4.map(|c| c[j] as f32));
-        let c = ball((lane(0) * (1. / q15), lane(1) * (1. / q15)), lane(2), lane(3) * (1. / (1u32 << 16) as f32), &v, rad, &look, aura);
+        let c = ball((lane(0) * (1. / q15), lane(1) * (1. / q15)), lane(2), lane(3) * (1. / (1u32 << 16) as f32), &v, rad, look, aura);
         [0, 1, 2, 3].map(|n| [c[0].0[n], c[1].0[n], c[2].0[n]])
     };
     // A coarse pass's component pixels waiting for a lane call: (pixel, cell).
