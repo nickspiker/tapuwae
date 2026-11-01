@@ -6,7 +6,7 @@ A mark drawn from a hash, recognisably one source's every time: the root spiral 
 
 - **Placement:** a straight-down descent onto the Mandelbrot set by proven distance-bound steps, then the Julia set just above the landing point.
 - **Framing:** dead centre on the root whorl (the repelling cycle closest to neutral), never a sub-spiral.
-- **Look:** OKLab pastels kept inside sRGB by construction, banded per source into families; lit from the escape potential's own slope; flames, distance contours and a near-infinity escape after mandelbrot-exploder.
+- **Look:** pastels picked in VSF RGB's own triangle, brought to their brightness by photopic luminance through LMS and held under white by construction, banded per source into families; lit from the escape potential's own slope; flames, distance contours and a near-infinity escape after mandelbrot-exploder.
 
 Used by ferros's attest screen and by Photon for default avatars and dev-build orbs.
 

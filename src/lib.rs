@@ -698,7 +698,7 @@ impl Params {
     }
 }
 
-/// A device's theme within the one soft scheme: every colour is OKLab lightness L at a hue with chroma C = sat·L, sat at most 2⁻³ + 2⁻⁵ (0.156), which keeps it soft and inside the sRGB gamut at every lightness (no hue goes negative below about 0.17·L; `soft_colours_stay_in_gamut` checks it).
+/// A device's theme within the one soft scheme: every colour is a lightness l (gamma 2: photopic luminance l²) at a hue in VSF RGB's triangle, mixed from white toward it by MIX·sat, sat at most 2⁻³ + 2⁻⁵ (0.156), which keeps it soft; `soft` holds it under white at every lightness and `soft_colours_stay_in_gamut` checks it.
 /// The salt varies far more than the colours: the ground's tone (pale, light, mid or dusk), which way the set sits against it (darker on pale grounds, lighter on dusk ones, either on mid), how strongly, whether its edge glows or is inked, how far the set's hue turns from the ground's (none, a sixth, a quarter, a third, a half, either way), how far the ground's hue drifts from the centre to the far field, and how saturated each layer is.
 #[derive(Clone, Copy)]
 struct Theme {
@@ -720,12 +720,14 @@ struct Theme {
     rim_s: f32,
     /// The device's lighting (see `Lighting`).
     lighting: Lighting,
-    /// The field's ripple: four waves across log₂ of the distance to the set, `ripple_f` turns per doubling and `ripple_a` amplitude; waves 0 and 1 move the lightness, 2 and 3 the OKLab a and b (green–red and blue–yellow), so the contours shift colour as well as tone.
+    /// The field's ripple: four waves across log₂ of the distance to the set, `ripple_f` turns per doubling and `ripple_a` amplitude; waves 0 and 1 move the lightness, 2 and 3 the two axes of the hue's plane (toward red, and across green–blue), so the contours shift colour as well as tone.
     ripple_f: [f32; 4],
     ripple_a: [f32; 4],
+    /// Each VSF RGB primary's share of photopic luminance, through LMS (`vsf_rgb_to_photopic_f32` of each primary; white is 1): what brings a hue to a brightness.
+    photopic: [f32; 3],
 }
 
-/// One lamp: where it shines from (x right, y down across the screen, z up out of the picture, a unit vector), how strongly it moves the lightness, and the tint it gives the faces it lights (an OKLab (a, b) direction, unit length, scaled at use).
+/// One lamp: where it shines from (x right, y down across the screen, z up out of the picture, a unit vector), how strongly it moves the lightness, and the tint it gives the faces it lights (a direction in the hue's plane, unit length, scaled at use).
 #[derive(Clone, Copy)]
 struct Lamp {
     dir: (f32, f32, f32),
@@ -845,41 +847,48 @@ impl Theme {
             lighting: Lighting::from_bytes(blake3::hash(f).as_bytes()),
             ripple_f: ripple.0,
             ripple_a: ripple.1,
+            photopic: [(1., 0., 0.), (0., 1., 0.), (0., 0., 1.)].map(|(r, g, b)| vsf::colour::convert::vsf_rgb_to_photopic_f32(r, g, b)),
         }
     }
 }
 
-/// OKLab (L, a, b) to display RGB in [0, 1]: OKLab's own matrices (Björn Ottosson's published constants, not tuning knobs) to linear sRGB, then gamma 2 (√) for display.
-/// Chroma held at most 0.156·L keeps every colour inside the sRGB gamut, so no channel goes negative (`soft_colours_stay_in_gamut` checks every hue).
-#[inline]
-fn oklab<L: Lane>(l: L, a: L, b: L) -> [L; 3] {
-    let l_ = l + a * 0.396_337_78 + b * 0.215_803_76;
-    let m_ = l - a * 0.105_561_346 - b * 0.063_854_17;
-    let s_ = l - a * 0.089_484_18 - b * 1.291_485_5;
-    let (l3, m3, s3) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
-    [
-        l3 * 4.076_741_7 - m3 * 3.307_711_6 + s3 * 0.230_969_94,
-        l3 * -1.268_438 + m3 * 2.609_757_4 - s3 * 0.341_319_38,
-        l3 * -0.004_196_086 - m3 * 0.703_418_6 + s3 * 1.707_614_7,
-    ]
-    .map(|c| c.sqrt())
-}
+/// How far toward its hue a colour mixes per unit of saturation (`soft`): the themes' saturations, chosen as chroma per lightness (at most 2⁻³ + 2⁻⁵, twice that on the lacquer), become mixes of up to about a third and two thirds.
+const MIX: f32 = (1 << 1) as f32;
 
-/// The soft colour at lightness `l`, saturation `sat` (chroma = sat·l), hue offset `dh` from the theme's base, plus a tint (an OKLab (a, b) offset in units of l), always inside the display's gamut, smoothly.
-/// Lightness passes a shoulder: unchanged up to 0.85, then easing toward 0.95 as 0.85 + 0.1·tanh((L − 0.85)/0.1), so the brightest grounds, glows and lit faces never wash out to white.
-/// Chroma (the theme's and the tint's together) is then held under the gamut at that lightness, which is about 0.17·L at the dark end (where a channel would go negative) and about 0.49·(1 − L) at the light end (where one would pass 1), measured over every hue: the cap is the smooth minimum of 0.16·L and 0.48·(1 − L), and the chroma eases into it as cap·tanh(C/cap), C∞ and nearly unchanged well inside it.
+/// The soft colour at lightness `l`, saturation `sat`, hue offset `dh` from the theme's base, plus a tint (an offset of the hue's vector, in units of saturation), in VSF RGB, gamma 2 for display (owner, 2026-11-01: colours are picked in VSF RGB's own triangle and brought to their brightness by photopic luminance through LMS; until then OKLab to linear sRGB, which the display read as VSF RGB, oversaturated and turned).
+/// Lightness passes a shoulder: unchanged up to 0.85, then easing toward 0.95 as 0.85 + 0.1·tanh((l − 0.85)/0.1), so the brightest grounds, glows and lit faces never wash out to white. It is a gamma-2 value: the colour's photopic luminance is l².
+/// The hue is a point in the triangle, each primary a raised cosine of it a third of a turn from the next (red at 0, green at a third, blue at two), never negative. Divided by its own photopic luminance (`Theme::photopic`) it stands at white's brightness, so white mixed toward it by m keeps the luminance exactly l² at every hue and mix.
+/// The mix (MIX times the saturation's length) is held under the top of the gamut, no channel past white: with e = l²·(q_max − 1) how far the largest channel climbs per unit of mix and r = 1 − l² the room above white, m eases as m/√(1 + (m·e/r)²), C∞, nearly m well inside and never past r/e. q_max is the 8-norm of the three, a little above the largest, so the cap errs inside.
 #[inline]
 fn soft<L: Lane>(th: &Theme, l: L, sat: L, dh: L, tint: (L, L)) -> [L; 3] {
     let (knee, room) = (0.85f32, 0.1f32);
     let l = pick(l.gt(L::splat(knee)), || ((l - knee) / room).ftanh() * room + knee, l);
-    let (h, c) = (dh + th.hue, sat * l);
-    let (a, b) = (c * h.fcos() + tint.0 * l, c * h.fsin() + tint.1 * l);
-    let cm = (a * a + b * b).sqrt();
-    let (lo, hi) = (l * 0.16, (L::splat(1.) - l) * 0.48);
-    let d = 1. / (1 << 6) as f32;
-    let cap = (lo + hi - ((lo - hi) * (lo - hi) + d * d).sqrt()) * 0.5;
-    let scale = pick(cm.gt(L::splat(0.)) & cap.gt(L::splat(0.)), || cap * (cm / cap).ftanh() / cm, L::splat(0.));
-    oklab(l, a * scale, b * scale)
+    let h = dh + th.hue;
+    let (a, b) = (sat * h.fcos() + tint.0, sat * h.fsin() + tint.1);
+    // WHY the floor: a grey (no saturation, no tint) has no hue; its mix is 0 anyway, and 2⁻²⁰ keeps 0/0 out of its pixel.
+    let cm = (a * a + b * b).sqrt() + 1. / (1 << 20) as f32;
+    let (u, v) = (a / cm, b / cm);
+    // cos and sin of 0, a third and two thirds of a turn: the primaries' places on the hue circle.
+    let half_sqrt3 = 0.866_025_4f32;
+    let q = [(1f32, 0f32), (-0.5, half_sqrt3), (-0.5, -half_sqrt3)].map(|(c, s)| {
+        let r = (u * c + v * s + 1.) * 0.5;
+        r * r
+    });
+    let yq = q[0] * th.photopic[0] + q[1] * th.photopic[1] + q[2] * th.photopic[2];
+    let qn = q.map(|c| c / yq);
+    let y = l * l;
+    let qmax = {
+        let p8 = qn.map(|c| {
+            let c2 = c * c;
+            let c4 = c2 * c2;
+            c4 * c4
+        });
+        (p8[0] + p8[1] + p8[2]).sqrt().sqrt().sqrt()
+    };
+    let m0 = cm * MIX;
+    let ex = m0 * y * (qmax - 1.) / (L::splat(1.) - y);
+    let m = m0 / (ex * ex + 1.).sqrt();
+    qn.map(|c| (y * ((c - 1.) * m + 1.)).sqrt())
 }
 
 /// A smooth (C∞) split of a signed amount into its positive part, (x + √(x² + δ²))/2 with δ = 2⁻⁶: about x when well positive, about 0 when well negative, and no corner at 0.
@@ -889,16 +898,16 @@ fn positive_part<L: Lane>(x: L) -> L {
     (x + (x * x + d * d).sqrt()) * 0.5
 }
 
-/// The metals' colours in linear light, each its reflectance at normal incidence (published F0 measurements; rose gold and blued titanium as their alloys and oxide show): gold, silver, copper, bronze, steel, rose gold, brass, titanium.
+/// The metals' colours in linear VSF RGB: each its reflectance at normal incidence, F0 = ((n−1)² + k²)/((n+1)² + k²) from its published optical constants (refractiveindex.info), under equal-energy light against VSF's cone fundamentals (Stockman & Sharpe 2000, 10°, 390-830 nm at 1 nm; each cone normalised so E is 1), then LMS to VSF RGB (owner, 2026-11-01: VSF RGB from the spectra, never sRGB). Gold, silver, copper: Johnson & Christy 1972. Bronze: commercial bronze, Cu90Zn10, Querry. Steel: austenitic stainless, Karlsson. Rose gold: no published n, k for gold-copper (still the old sRGB value: the owner decides). Brass: cartridge brass, Cu70Zn30, Querry. Titanium: bare, Johnson & Christy 1974 (the old value was blued, an oxide film).
 const METALS: [[f32; 3]; 8] = [
-    [1.00, 0.71, 0.29],
-    [0.95, 0.93, 0.88],
-    [0.95, 0.64, 0.54],
-    [0.80, 0.55, 0.34],
-    [0.56, 0.57, 0.58],
+    [0.8962, 0.7321, 0.4054],
+    [0.9868, 0.9843, 0.9778],
+    [0.7944, 0.6464, 0.5320],
+    [0.8479, 0.7241, 0.4836],
+    [0.6546, 0.6407, 0.6001],
     [0.97, 0.70, 0.60],
-    [0.91, 0.78, 0.42],
-    [0.52, 0.56, 0.70],
+    [0.8399, 0.7818, 0.4433],
+    [0.6005, 0.5813, 0.5459],
 ];
 
 /// A studio around the picture, as a metal sees it: the brightness reflected along `rr` (a unit vector, screen x right, y down, z out), a bright sky above falling smoothly to a dim floor below, and a faint soft-box at the key lamp `l`.
@@ -1864,7 +1873,7 @@ mod tests {
         }
     }
 
-    /// Every colour the shading can ask for stays inside the display's gamut at every hue: no channel below 0 or above 1 (a hair of rounding allowed), for lightness from 0.05 to past white (the shoulder brings it in) at the most saturation and tint any layer gets, and beyond.
+    /// Every colour the shading can ask for stays inside VSF RGB's gamut at every hue, no channel below 0 or above white (a hair of rounding allowed), and at exactly the photopic luminance its lightness asks for (l² after the shoulder), for lightness from 0.05 to past white at the most saturation and tint any layer gets, and beyond.
     #[test]
     fn soft_colours_stay_in_gamut() {
         let mut th = Theme::from_bytes(&[0; 32]);
@@ -1874,12 +1883,15 @@ mod tests {
                 for sat in [0f32, 0.07, 0.124, 0.2] {
                     let rgb = soft(&th, l, sat, 0., (0.04 * th.hue.cos(), 0.04 * th.hue.sin()));
                     assert!(rgb.iter().all(|x| x.is_finite() && *x >= 0. && *x <= 1. + 1. / (1 << 10) as f32), "hue {i}, L {l}, sat {sat}: {rgb:?}");
+                    let ls = if l > 0.85 { ((l - 0.85) / 0.1).tanh() * 0.1 + 0.85 } else { l };
+                    let y = vsf::colour::convert::vsf_rgb_to_photopic_f32(rgb[0] * rgb[0], rgb[1] * rgb[1], rgb[2] * rgb[2]);
+                    assert!((y - ls * ls).abs() < 1. / (1 << 12) as f32, "hue {i}, L {l}, sat {sat}: luminance {y}, wanted {}", ls * ls);
                 }
             }
         }
     }
 
-    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the render took its own maths (fm, 2026-10-29: a step of one 8-bit level on a few pixels; the same on every platform from here), pinned again 2026-11-01 for even placement with no framing test (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
+    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the render took its own maths (fm, 2026-10-29: a step of one 8-bit level on a few pixels; the same on every platform from here), pinned again 2026-11-01 for even placement with no framing test, and again the same day for colour picked in VSF RGB and metals from their spectra (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
     #[test]
     fn avatars_hold_still() {
         let mut h = blake3::Hasher::new();
@@ -1893,7 +1905,7 @@ mod tests {
                 h.update(&p.to_le_bytes());
             }
         }
-        assert_eq!(h.finalize().to_hex().as_str(), "b3b3a272e38b392eb69a42bcd8745acccdc97504702eb2f7186af9b77f85b62e");
+        assert_eq!(h.finalize().to_hex().as_str(), "099f3b7fa0b6bf03a52beeb66a6499b08f726c6590e4168219baee9d040a1894");
     }
 
     /// A spiral's eye really is periodic: f^p carries it back onto itself.
