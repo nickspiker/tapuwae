@@ -4,7 +4,7 @@
 //!
 //! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the colouring method and the theme: one soft, low-contrast scheme for every device, varied widely in tone, polarity, edge, hue relations and saturation (see `Theme`).
 //!
-//! Placement, the descent: pick x in [−2, X_RIGHT ≈ 0.4715], the set's whole real extent, slanted toward the right (density rising linearly from 0 at the antenna's tip, as x = −2 + span·√u, since the left third is all needles), and come straight down the line Re c = x from Im c = 2, each step the proven lower bound on the distance to the Mandelbrot set (see `descend`), until within 2⁻¹² of the set — the set's skyline seen from above, its outermost contact on that line, from the antenna through the bulb tops and seahorse valley to the cusp.
+//! Placement, the descent: pick x in [−2, X_RIGHT ≈ 0.4715], the set's whole real extent, evenly (x = −2 + span·u; slanted toward the right by √u until 2026-11-01), and come straight down the line Re c = x from Im c = 2, each step the proven lower bound on the distance to the Mandelbrot set (see `descend`), until within 2⁻¹² of the set — the set's skyline seen from above, its outermost contact on that line, from the antenna through the bulb tops and seahorse valley to the cusp.
 //! Lines between the cusp (0.25) and the cardioid's own rightmost point (0.375) that pass beside the bulbs reach the real axis just outside the set, in the parabolic-implosion region, which is kept; past 0.375 they land on the decorations of the bulbs near the top right.
 //! c is the landing point raised by 2^−(4..12) back up the line it came down (see HEIGHT_STOPS). Every point of that line above the landing was proven outside the set by the steps that crossed it, so c is always outside, J(c) is a Cantor dust with no inside to go flat, and near the boundary J(c) resembles the Mandelbrot set around c.
 //!
@@ -71,10 +71,6 @@ const BAIL_SQ: f64 = 1.340_780_792_994_259_7e154;
 /// The render's escape: |z|² past 2⁶², so the next square stays finite with room to spare (at most 2¹²⁴, against f32's 2¹²⁸), and the smooth count, the distance estimate and the flames get nearly every clean bit of the escape.
 /// WHY not √(f32::MAX) (mandelbrot-exploder's rule, used here until 2026-10-29): an orbit just under it squares to just under f32::MAX, and the + c and the rounding of x² + y² carried |z|² to ∞, which made the smooth count −∞ and the flame NaN; about one sample in 2²⁶ (measured), each poisoning its pixel.
 const BAIL_SQ_F32: f32 = (1u64 << 62) as f32;
-/// A jump of 2² iterations between neighbouring thumbnail pixels marks an edge of the set.
-const JUMP: i32 = 1 << 2;
-/// A framing is kept when at least a quarter of the thumbnail is edge.
-const DETAIL_MIN: f64 = 1. / (1 << 2) as f64;
 /// Stops of height for c above its landing point, from 2⁻⁴ down: much above 2⁻⁴ J(c) thins into sparse dust, and below 2⁻¹² the landing's own tolerance (2⁻¹²) dominates, so the 2³ stops between are the ones that matter.
 const HEIGHT_STOPS: u32 = 1 << 3;
 /// Periods sprayed for a spiral's cycle: 1 to 2⁴.
@@ -282,34 +278,6 @@ fn scale(half: f64, w: usize, h: usize) -> f32 {
     (half / (span * 0.5)) as f32
 }
 
-/// How much edge a 2⁵ × 2⁶ thumbnail shows: the share of pixels whose iteration count jumps by at least 2² to the neighbour on the right or below.
-/// Only filaments of the set make such jumps; the smooth field between them makes none, so the score reads "how much of the view is set" at every zoom.
-fn detail(p: &Params) -> f64 {
-    const W: usize = 1 << 5;
-    const H: usize = 1 << 6;
-    let v = p.view();
-    let k = scale(p.half, W, H);
-    let mut n = [0i32; W * H];
-    for py in 0..H {
-        for px in 0..W {
-            let (x, y) = plane(&v, px, py, W, H, k);
-            n[py * W + px] = orbit(x, y, &v).n as i32;
-        }
-    }
-    let mut edges = 0;
-    for py in 0..H - 1 {
-        for px in 0..W - 1 {
-            let i = py * W + px;
-            edges += ((n[i] - n[i + 1]).abs().max((n[i] - n[i + W]).abs()) >= JUMP) as u32;
-        }
-    }
-    edges as f64 / ((W - 1) * (H - 1)) as f64
-}
-
-fn framed(p: &Params) -> bool {
-    detail(p) >= DETAIL_MIN
-}
-
 /// One inverse branch of z² + c: ±√(z − c), the principal root, negated when `negate`.
 fn inverse(c: (f64, f64), z: (f64, f64), negate: bool) -> (f64, f64) {
     let (ax, ay) = (z.0 - c.0, z.1 - c.1);
@@ -503,7 +471,7 @@ fn classify(c: (f64, f64)) -> Class {
     Class::Undecided
 }
 
-/// The descent: down the line Re c = x from Im c = 2, until within 2⁻¹² of the set, onto it (proven inside or undecided), or onto the real axis; at most 2⁹ steps.
+/// The descent: down the line Re c = x from Im c = 2, until within 2⁻¹² of the set, onto it (proven inside or undecided), or onto the real axis; at most 2⁹ steps, and a descent that uses them all lands on the axis (owner, 2026-11-01: "if it limits out, just set i=0"): still coming down that close to the needle or a filament, the real line beneath it, which is in the set from −2 to ¼ (and only there: the flag says so).
 /// Each step is the PROVEN lower bound on the distance to the set (Koebe, via Milnor): with G = ln|z|/2ⁿ the Green's function and d = |z|·ln|z|/|dc| the estimate (= G/|G′|), the true distance is at least sinh G / (2·e^G·|G′|) = d·(1 − e^(−2G))/(4G).
 /// That factor is ½ next to the set and smaller far out (about 0.22 at G = 1), so the step never jumps past anything, not even a hair-thin filament, and the descent stops at the first, outermost contact along the line.
 /// Returns the landing point, whether it is on the set (false when the line missed it and reached the axis), and every point it checked, in order.
@@ -513,11 +481,11 @@ pub fn descend(x: f64) -> ((f64, f64), bool, Vec<(f64, f64)>) {
     for _ in 0..(1 << 9) {
         trail.push((x, y));
         let Class::Outside { n, r, dm } = classify((x, y)) else {
-            break;
+            return ((x, y), true, trail);
         };
         let d = r * r.ln() / dm;
         if d < 1. / (1 << 12) as f64 {
-            break;
+            return ((x, y), true, trail);
         }
         // G underflows to 0 for orbits longer than about 2¹⁰ steps, where the factor's limit, ½, is exact enough.
         let g = r.ln() * (-(n as f64)).exp2();
@@ -528,7 +496,8 @@ pub fn descend(x: f64) -> ((f64, f64), bool, Vec<(f64, f64)>) {
             return ((x, 0.), false, trail);
         }
     }
-    ((x, y), true, trail)
+    trail.push((x, 0.));
+    ((x, 0.), x <= 0.25, trail)
 }
 
 /// A progressive walk in [0, 1): the device's own starting value (the hash of the empty text), then for the i-th character (from 1) a nudge of up to ±2^−(i+1), from the hash of the text up to and including it, so the first characters move the picture a lot and each later one half as much as the one before; by the 25th a nudge is under 2⁻²⁵.
@@ -676,67 +645,56 @@ impl Params {
         let attest = Attest::new(salt);
         let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), theme, mode, trap, keyed, attest, radius: 1. };
 
-        // Each try draws a fresh c and framing from (salt, text, counter); the first framing that shows enough of the set is taken, and after 2⁵ tries the last one stands.
-        let mut n = 0;
-        loop {
-            // The discrete choices (which sprayed cycles, which point of the winning cycle) are the device's own, so only c moves them.
-            let t = draw(salt, 3, n, if progressive { &[] } else { text.as_bytes() });
-            // √u: density rising linearly toward the right, so fewer keys land among the antenna's needles.
-            let x = -2. + pick(16, n, false).sqrt() * span;
-            n += 1;
-            let (land, _, _) = descend(x);
-            let c = (land.0, land.1 + (-(4. + pick(17, n - 1, false) * HEIGHT_STOPS as f64)).exp2());
-            let along = j_extent(c);
-            // Every key sits on the ROOT whorl's eye, dead centre, never a preimage of it (a preimage is a smaller copy: a sub-spiral).
-            // The root is the cycle closest to neutral (smallest ln|λ|): it turns slowest and grows slowest, so its whorl is the largest in the picture. Candidates: the cycle of the component beneath the landing (`root_cycle`, near-neutral when that component is close, and losing on its own when it is far), the α fixed point in closed form (the root near the main cardioid), and 2⁵ sprayed cycles of periods 1 to 2⁴.
-            // The hash picks which of the cycle's own points to sit on: each is a root, mapped onto the next by f.
-            let spiral = {
-                // The α fixed point, z = (1 − √(1 − 4c))/2 with λ = 2z: the root near the main cardioid.
-                let alpha = {
-                    let s = {
-                        let (ax, ay) = (1. - 4. * c.0, -4. * c.1);
-                        let r = (ax * ax + ay * ay).sqrt();
-                        let (sx, sy) = (((r + ax) * 0.5).sqrt(), ((r - ax) * 0.5).sqrt());
-                        (sx, if ay < 0. { -sy } else { sy })
-                    };
-                    let z = ((1. - s.0) * 0.5, -s.1 * 0.5);
-                    close_cycle(c, z, 1).map(|(w, l, g)| (w, l, g, 1))
+        // One c and one framing from (salt, text): every landing is on the set, so every pick stands (owner, 2026-11-01). Until then a framing showing less than a quarter edge in a thumbnail was drawn again, up to 2⁵ times, and the needle's Julia sets (hairlines in a smooth field, 0.007-0.14 of edge) never stood: no key of 256 kept one left of −1.5.
+        // The discrete choices (which sprayed cycles, which point of the winning cycle) are the device's own, so only c moves them.
+        let n = 0;
+        let t = draw(salt, 3, n, if progressive { &[] } else { text.as_bytes() });
+        // Even across the span (owner, 2026-11-01): every stretch of the line as likely as any other, the needle's included. Until then √u, a density rising from 0 at the antenna's tip.
+        let x = -2. + pick(16, n, false) * span;
+        let (land, _, _) = descend(x);
+        let c = (land.0, land.1 + (-(4. + pick(17, n, false) * HEIGHT_STOPS as f64)).exp2());
+        let along = j_extent(c);
+        // Every key sits on the ROOT whorl's eye, dead centre, never a preimage of it (a preimage is a smaller copy: a sub-spiral).
+        // The root is the cycle closest to neutral (smallest ln|λ|): it turns slowest and grows slowest, so its whorl is the largest in the picture. Candidates: the cycle of the component beneath the landing (`root_cycle`, near-neutral when that component is close, and losing on its own when it is far), the α fixed point in closed form (the root near the main cardioid), and 2⁵ sprayed cycles of periods 1 to 2⁴.
+        // The hash picks which of the cycle's own points to sit on: each is a root, mapped onto the next by f.
+        let spiral = {
+            // The α fixed point, z = (1 − √(1 − 4c))/2 with λ = 2z: the root near the main cardioid.
+            let alpha = {
+                let s = {
+                    let (ax, ay) = (1. - 4. * c.0, -4. * c.1);
+                    let r = (ax * ax + ay * ay).sqrt();
+                    let (sx, sy) = (((r + ax) * 0.5).sqrt(), ((r - ax) * 0.5).sqrt());
+                    (sx, if ay < 0. { -sy } else { sy })
                 };
-                let sprayed = (0..SPIRAL_TRIES).filter_map(|i| {
-                    let period = 1 + (i & (PERIODS - 1));
-                    cycle_point(c, &draw(salt, 4, (n << 5) | i, if progressive { &[] } else { text.as_bytes() }), period).map(|(w, l, g)| (w, l, g, period))
-                });
-                root_cycle(c, land).into_iter().chain(alpha).chain(sprayed).fold(None, |best: Option<((f64, f64), f64, f64, u32)>, e| if best.map_or(true, |b| e.1 < b.1) { Some(e) } else { best })
+                let z = ((1. - s.0) * 0.5, -s.1 * 0.5);
+                close_cycle(c, z, 1).map(|(w, l, g)| (w, l, g, 1))
             };
-            // α always closes for c outside the set (it repels there); if even that failed, the next try draws a new c, and after 2⁵ tries the whole of J(c), straight, stands.
-            let Some((first, _, _, period)) = spiral else {
-                if n >= 1 << 5 {
-                    return Params { c, half: along * 1.125, radius: along * 1.125, ..base };
-                }
-                continue;
-            };
-            {
-                let mut eye = first;
-                for _ in 0..(t[6] as u32 % period) {
-                    let ee = cmul(eye, eye);
-                    eye = (ee.0 + c.0, ee.1 + c.1);
-                }
-                // The whorl's radius R: 2⁻¹ to 2⁻³ of J's half-extent, or larger until the f32 render resolves it.
-                let mut stops = 1. + pick(18, n - 1, false) * 2.;
-                let radius = loop {
-                    let radius = along * (-stops).exp2();
-                    if radius >= MIN_HALF || stops <= 1. {
-                        break radius;
-                    }
-                    stops -= 1.;
-                };
-                let turn = pick(19, n - 1, true) * TAU;
-                let p = Params { c, centre: eye, half: radius, radius, rot: (turn.cos(), turn.sin()), ..base };
-                if framed(&p) || n >= 1 << 5 {
-                    return p;
-                }
-            }
+            let sprayed = (0..SPIRAL_TRIES).filter_map(|i| {
+                let period = 1 + (i & (PERIODS - 1));
+                cycle_point(c, &draw(salt, 4, (n << 5) | i, if progressive { &[] } else { text.as_bytes() }), period).map(|(w, l, g)| (w, l, g, period))
+            });
+            root_cycle(c, land).into_iter().chain(alpha).chain(sprayed).fold(None, |best: Option<((f64, f64), f64, f64, u32)>, e| if best.map_or(true, |b| e.1 < b.1) { Some(e) } else { best })
+        };
+        // α always closes for c outside the set (it repels there); if even that failed, the whole of J(c), straight.
+        let Some((first, _, _, period)) = spiral else {
+            return Params { c, half: along * 1.125, radius: along * 1.125, ..base };
+        };
+        let mut eye = first;
+        for _ in 0..(t[6] as u32 % period) {
+            let ee = cmul(eye, eye);
+            eye = (ee.0 + c.0, ee.1 + c.1);
         }
+        // The whorl's radius R: 2⁻¹ to 2⁻³ of J's half-extent, or larger until the f32 render resolves it.
+        let mut stops = 1. + pick(18, n, false) * 2.;
+        let radius = loop {
+            let radius = along * (-stops).exp2();
+            if radius >= MIN_HALF || stops <= 1. {
+                break radius;
+            }
+            stops -= 1.;
+        };
+        let turn = pick(19, n, true) * TAU;
+        Params { c, centre: eye, half: radius, radius, rot: (turn.cos(), turn.sin()), ..base }
     }
 }
 
@@ -1871,6 +1829,21 @@ fn render_locator(buf: &mut [u32], w: usize, h: usize, p: &Params, centre: (f64,
 
 #[cfg(test)]
 mod tests {
+    /// Where keys land on the real line, a tenth of the span a bucket: the placement's distribution as it stands (2026-11-01: a framing test threw away every pick on the needle). `cargo test --release -- --ignored --nocapture where_keys_land`
+    #[test]
+    #[ignore]
+    fn where_keys_land() {
+        let mut kept = [0u32; 10];
+        for k in 0u32..1 << 8 {
+            let salt = *blake3::hash(&k.to_le_bytes()).as_bytes();
+            let p = Params::new(&salt, "");
+            kept[(((p.c.0 + 2.) / (X_RIGHT + 2.)) * 10.) as usize] += 1;
+        }
+        for (b, k) in kept.iter().enumerate() {
+            println!("{b}  from {:+.3}  {k}", -2. + (X_RIGHT + 2.) * b as f64 / 10.);
+        }
+    }
+
     use super::*;
 
     /// Every stand-in device draws a picture with structure, and a change in the text changes it.
@@ -1906,7 +1879,7 @@ mod tests {
         }
     }
 
-    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the render took its own maths (fm, 2026-10-29: a step of one 8-bit level on a few pixels; the same on every platform from here) (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
+    /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the render took its own maths (fm, 2026-10-29: a step of one 8-bit level on a few pixels; the same on every platform from here), pinned again 2026-11-01 for even placement with no framing test (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
     #[test]
     fn avatars_hold_still() {
         let mut h = blake3::Hasher::new();
@@ -1920,7 +1893,7 @@ mod tests {
                 h.update(&p.to_le_bytes());
             }
         }
-        assert_eq!(h.finalize().to_hex().as_str(), "71fa896f4f79becbd5c82f4951722c978df4d4a75b5c09a9c4cabf403b4705fa");
+        assert_eq!(h.finalize().to_hex().as_str(), "b3b3a272e38b392eb69a42bcd8745acccdc97504702eb2f7186af9b77f85b62e");
     }
 
     /// A spiral's eye really is periodic: f^p carries it back onto itself.
