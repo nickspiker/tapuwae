@@ -35,6 +35,8 @@ use rayon::prelude::*;
 mod fm;
 use fm::Fast;
 mod lanes;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 use lanes::{live, pick, select, Bits, Lane, Mask, F4};
 #[cfg(not(feature = "std"))]
 mod nostd;
@@ -1560,6 +1562,25 @@ impl<'a> Button<'a> {
         Spot::Ball((sx / BALL, sy / BALL))
     }
 
+    /// `at` then `ball` for one sample of any lane type at once, every case worked out and the right one picked by selects where `at` branches (a GPU invocation is one sample: tapuwae::gpu). The same arithmetic in the same order as `at` and `ball`; `sample_is_at_then_ball` holds it to them on the CPU.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    fn sample<L: Lane>(&self, dx: L, dy: L) -> ([L; 3], L) {
+        let (zero, one) = (L::splat(0.), L::splat(1.));
+        let (sx, sy) = (dx / self.r, dy / self.r);
+        let s2 = sx * sx + sy * sy;
+        let q2 = s2 / self.b2;
+        let u = one + (s2 - self.b2).flog2() / self.octaves - self.q_end.flog2() / self.octaves;
+        let light = (positive_part(one - u) - positive_part(-u)) * (one - s2.powi(1 << 3));
+        let ball = self.ball((sx / BALL, sy / BALL));
+        let aura = self.aura.map(L::splat);
+        let (out, glow) = (s2.ge(one), q2.gt(one));
+        let rim = q2.ge(one) & !glow;
+        let pick3 = |m: L::M, a: [L; 3], b: [L; 3]| [0, 1, 2].map(|i| L::select(m, a[i], b[i]));
+        let c = pick3(out, [zero; 3], pick3(glow | rim, aura, ball));
+        let a = L::select(out, zero, L::select(glow, light, one));
+        (c, a)
+    }
+
     /// The ball's colour (display gamma) at disc point q (|q| < 1), one sample or four (`Lane`): spherized, shaded, tapering into the device's colour at the rim by the look's vignette.
     #[inline]
     fn ball<L: Lane>(&self, q: (L, L)) -> [L; 3] {
@@ -2084,6 +2105,33 @@ mod tests {
             }
         }
         assert_eq!(h.finalize().to_hex().as_str(), "8ad835fa14e7adc0e226c03f894118872d97c985d16fe439391e5db331f6a826");
+    }
+
+    /// The GPU's per-sample form (`Button::sample`, selects) gives what `at` then `ball` give (branches), bit for bit, on the CPU's one lane: across the disc, its glow, its rim and outside.
+    #[test]
+    fn sample_is_at_then_ball() {
+        let salt = *blake3::hash(b"sample").as_bytes();
+        let p = Params::new_placed(&salt, "handle", true);
+        let look = Look::attest();
+        let r = 40f32;
+        let bt = Button::new(&p, &look, r);
+        let mut checked = 0;
+        for iy in -44i32..44 {
+            for ix in -44i32..44 {
+                let (dx, dy) = (ix as f32 + 0.5, iy as f32 + 0.5);
+                let (c, a) = match bt.at(dx, dy) {
+                    Spot::Plain(c, a) => (c, a),
+                    Spot::Ball(q) => (bt.ball(q), 1.),
+                };
+                let (sc, sa) = bt.sample(dx, dy);
+                assert_eq!(a.to_bits(), sa.to_bits(), "coverage at ({dx}, {dy})");
+                for i in 0..3 {
+                    assert_eq!(c[i].to_bits(), sc[i].to_bits(), "channel {i} at ({dx}, {dy})");
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 88 * 88);
     }
     #[test]
     fn avatars_hold_still() {

@@ -7,6 +7,8 @@ description = "A recognisable mark from a hash: the root spiral of a Julia set p
 repository = "https://github.com/nickspiker/tapuwae"
 
 [features]
+# gpu: the mark as a GPU kernel through valhall's recording lane type (ferros, the attest mark on the Mali-G715: src/gpu.rs).
+gpu = ["dep:valhall"]
 # std: rows across the cores (rayon) and the platform's float maths. Without it (ferros's no_std processes) rows run one after another and the maths comes from libm.
 default = ["std"]
 std = ["dep:rayon", "blake3/std"]
@@ -17,3 +19,4 @@ rayon = { version = "1", optional = true }
 libm = "0.2"
 # VSF RGB's photopic luminance through LMS: the mark's colours are picked in VSF RGB (owner, 2026-11-01: no sRGB, no OKLab, no 1931 space).
 vsf = { version = "0.10", path = "../vsf", default-features = false }
+valhall = { path = "../ferros/valhall", features = ["ssa"], optional = true }
