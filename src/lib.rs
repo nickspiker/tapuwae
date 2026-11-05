@@ -151,6 +151,30 @@ fn cmul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
 
 /// What one orbit did, per lane: iterations until escape (MAX_ITER if it never did), z at escape, the derivative's magnitude, and the closest approach to the trap point (squared).
 /// The counts (`n`, `dm_exp`) are whole numbers held as floats, exact far past any count here, so four lanes keep them in one register beside the rest.
+/// The orbit's state round its loop (`orbit`, through `Lane::iterate`): every field a lane or a mask, so a GPU lane type carries it as a row of handles. `x2`, `y2`, `r2` are the head's, for the tail.
+#[derive(Clone, Copy)]
+struct Carry<L: Lane> {
+    z: (L, L),
+    plus: L,
+    dm: L,
+    dm_exp: L,
+    dir: (L, L),
+    trap_sq: L,
+    fq: (L, L),
+    fq_w: L,
+    fc: (L, L),
+    fc_w: L,
+    lv: L,
+    ray: L,
+    ln_turn: L,
+    engraved: L::M,
+    running: L::M,
+    n_esc: L,
+    x2: L,
+    y2: L,
+    r2: L,
+}
+
 struct Orbit<L> {
     n: L,
     x: L,
@@ -178,76 +202,83 @@ struct Orbit<L> {
 #[inline]
 fn orbit<L: Lane>(px: L, py: L, v: &View) -> Orbit<L> {
     let (zero, one) = (L::splat(0.), L::splat(1.));
-    let (mut z, c, mut plus, mut dm) = match v.kind {
+    let (z, c, plus, dm) = match v.kind {
         Kind::Plane => ((zero, zero), (px, py), one, zero),
         Kind::Julia => ((px, py), (L::splat(v.c.0), L::splat(v.c.1)), zero, one),
     };
     let julia = v.kind == Kind::Julia;
-    let mut trap_sq = L::splat(f32::MAX);
+    let trap_sq = L::splat(f32::MAX);
     // The derivative's direction, a unit complex number: dz ← 2·z·dz turns it by arg z each step. Kept apart from its magnitude (dm) so it never overflows, however close to the set.
-    let mut dir = (one, zero);
+    let dir = (one, zero);
     // The flame sums and weights.
-    let (mut fq, mut fq_w, mut fc, mut fc_w) = ((zero, zero), zero, (zero, zero), zero);
+    let (fq, fq_w, fc, fc_w) = ((zero, zero), zero, (zero, zero), zero);
     // The taper's scale: ln ln of the escape.
     let lnln_bail = BAIL_SQ_F32.fln().fln();
     let ln_2ln2 = (2. * 2f32.fln()).fln();
-    let mut dm_exp = zero;
-    let (mut lv, mut ray, mut ln_turn, mut engraved) = (zero, zero, zero, L::M::splat(false));
-    // The lanes still iterating, and the iteration each escaped at.
-    let mut running = L::M::splat(true);
-    let mut n_esc = L::splat(MAX_ITER as f32);
-    for n in 0..MAX_ITER {
-        let (x2, y2) = (z.0 * z.0, z.1 * z.1);
-        let r2 = x2 + y2;
-        let esc = running & r2.gt(L::splat(BAIL_SQ_F32));
-        if esc.any() {
-            n_esc = select(esc, L::splat(n as f32), n_esc);
-            running = running & !esc;
-            if !running.any() {
-                break;
+    let dm_exp = zero;
+    let (lv, ray, ln_turn, engraved) = (zero, zero, zero, L::M::splat(false));
+    // The lanes still iterating, and the iteration each escaped at; the loop through `Lane::iterate` (the head up to where a lane that escapes leaves, the tail after it), so a GPU lane type records it once.
+    let s = Carry { z, plus, dm, dm_exp, dir, trap_sq, fq, fq_w, fc, fc_w, lv, ray, ln_turn, engraved, running: L::M::splat(true), n_esc: L::splat(MAX_ITER as f32), x2: zero, y2: zero, r2: zero };
+    let s = L::iterate(
+        MAX_ITER,
+        s,
+        |n, mut s| {
+            s.x2 = s.z.0 * s.z.0;
+            s.y2 = s.z.1 * s.z.1;
+            s.r2 = s.x2 + s.y2;
+            let esc = s.running & s.r2.gt(L::splat(BAIL_SQ_F32));
+            if esc.any() {
+                s.n_esc = select(esc, n, s.n_esc);
+                s.running = s.running & !esc;
             }
-        }
-        let first = running & !engraved & r2.gt(L::splat(ENGRAVE_SQ));
-        if first.any() {
-            engraved = engraved | first;
-            lv = select(first, L::splat(n as f32 + 1.) - (r2.fln() / ENGRAVE_SQ.fln()).flog2(), lv);
-            ray = select(first, z.1.fatan2(z.0) * (1. / TAU as f32), ray);
-            ln_turn = select(first, dm.fln() + dm_exp * core::f32::consts::LN_2 - r2.fln() * 0.5, ln_turn);
-        }
-        let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
-        trap_sq = live::<L, _>(running, trap_sq.min(tx * tx + ty * ty), trap_sq);
-        let rz = r2.sqrt();
-        // One reciprocal a step serves every term that divides by |z| or |z|² (the flames' weights and means, the direction's turn): a vector divide is among the slowest instructions, and this loop took seven a step.
-        let inv = one / rz;
-        let inv2 = inv * inv;
-        // Flames: iter² weights; past |z|² = 4 the z-flame tapers as (1 − ((ln ln |z|² − ln(2 ln 2)) / ln ln bail)²)⁶, which is in [0, 1] there because |z|² > 4 makes ln ln |z|² > ln(2 ln 2).
-        let it = (n + 1) as f32;
-        let it2 = it * it;
-        let taper = pick(running & r2.gt(L::splat(4.)), || { let t = (r2.fln().fln() - ln_2ln2) / lnln_bail; let t = one - t * t; let t = t * t; t * t * t }, one);
-        let wq = taper * it2;
-        fq_w = live::<L, _>(running, fq_w + wq, fq_w);
-        let wq_inv = wq * inv;
-        fq = live::<L, _>(running, (fq.0 + z.0 * wq_inv, fq.1 + z.1 * wq_inv), fq);
-        fc_w = live::<L, _>(running, fc_w + inv, fc_w);
-        fc = live::<L, _>(running, (fc.0 + z.0 * inv2, fc.1 - z.1 * inv2), fc);
-        let dm_next = rz * 2. * dm + plus;
-        // Only a running lane rescales: a frozen one's derivative would keep growing and move its dm_exp after its escape.
-        let big = running & dm_next.gt(L::splat((1u64 << 63) as f32 * 2.));
-        dm = live::<L, _>(running, dm_next, dm);
-        if big.any() {
-            let s = 1. / ((1u64 << 63) as f32 * 2.);
-            dm = select(big, dm * s, dm);
-            plus = select(big, plus * s, plus);
-            dm_exp = select(big, dm_exp + 64., dm_exp);
-        }
-        // The direction turns by z/|z|, a unit number: a product of unit numbers stays unit to rounding, so it needs no root or divide a step; it is made unit once more where it is read.
-        if julia {
-            let (zx, zy) = (z.0 * inv, z.1 * inv);
-            let d = (dir.0 * zx - dir.1 * zy, dir.0 * zy + dir.1 * zx);
-            dir = live::<L, _>(running, d, dir);
-        }
-        z = live::<L, _>(running, (x2 - y2 + c.0, z.0 * 2. * z.1 + c.1), z);
-    }
+            (s, s.running)
+        },
+        |n, mut s| {
+            let (x2, y2, r2, running, z) = (s.x2, s.y2, s.r2, s.running, s.z);
+            let first = running & !s.engraved & r2.gt(L::splat(ENGRAVE_SQ));
+            if first.any() {
+                s.engraved = s.engraved | first;
+                s.lv = select(first, n + 1. - (r2.fln() / ENGRAVE_SQ.fln()).flog2(), s.lv);
+                s.ray = select(first, z.1.fatan2(z.0) * (1. / TAU as f32), s.ray);
+                s.ln_turn = select(first, s.dm.fln() + s.dm_exp * core::f32::consts::LN_2 - r2.fln() * 0.5, s.ln_turn);
+            }
+            let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
+            s.trap_sq = live::<L, _>(running, s.trap_sq.min(tx * tx + ty * ty), s.trap_sq);
+            let rz = r2.sqrt();
+            // One reciprocal a step serves every term that divides by |z| or |z|² (the flames' weights and means, the direction's turn): a vector divide is among the slowest instructions, and this loop took seven a step.
+            let inv = one / rz;
+            let inv2 = inv * inv;
+            // Flames: iter² weights; past |z|² = 4 the z-flame tapers as (1 − ((ln ln |z|² − ln(2 ln 2)) / ln ln bail)²)⁶, which is in [0, 1] there because |z|² > 4 makes ln ln |z|² > ln(2 ln 2).
+            let it = n + 1.;
+            let it2 = it * it;
+            let taper = pick(running & r2.gt(L::splat(4.)), || { let t = (r2.fln().fln() - ln_2ln2) / lnln_bail; let t = one - t * t; let t = t * t; t * t * t }, one);
+            let wq = taper * it2;
+            s.fq_w = live::<L, _>(running, s.fq_w + wq, s.fq_w);
+            let wq_inv = wq * inv;
+            s.fq = live::<L, _>(running, (s.fq.0 + z.0 * wq_inv, s.fq.1 + z.1 * wq_inv), s.fq);
+            s.fc_w = live::<L, _>(running, s.fc_w + inv, s.fc_w);
+            s.fc = live::<L, _>(running, (s.fc.0 + z.0 * inv2, s.fc.1 - z.1 * inv2), s.fc);
+            let dm_next = rz * 2. * s.dm + s.plus;
+            // Only a running lane rescales: a frozen one's derivative would keep growing and move its dm_exp after its escape.
+            let big = running & dm_next.gt(L::splat((1u64 << 63) as f32 * 2.));
+            s.dm = live::<L, _>(running, dm_next, s.dm);
+            if big.any() {
+                let sc = 1. / ((1u64 << 63) as f32 * 2.);
+                s.dm = select(big, s.dm * sc, s.dm);
+                s.plus = select(big, s.plus * sc, s.plus);
+                s.dm_exp = select(big, s.dm_exp + 64., s.dm_exp);
+            }
+            // The direction turns by z/|z|, a unit number: a product of unit numbers stays unit to rounding, so it needs no root or divide a step; it is made unit once more where it is read.
+            if julia {
+                let (zx, zy) = (z.0 * inv, z.1 * inv);
+                let d = (s.dir.0 * zx - s.dir.1 * zy, s.dir.0 * zy + s.dir.1 * zx);
+                s.dir = live::<L, _>(running, d, s.dir);
+            }
+            s.z = live::<L, _>(running, (x2 - y2 + c.0, z.0 * 2. * z.1 + c.1), z);
+            s
+        },
+    );
+    let Carry { z, dm, dm_exp, dir, trap_sq, fq, fq_w, fc, fc_w, lv, ray, ln_turn, n_esc, .. } = s;
     let escaped = n_esc.lt(L::splat(MAX_ITER as f32));
     // u = z / dz, as a direction: z/|z| times the conjugate of dz's direction.
     let (ux, uy) = if julia {
@@ -2034,6 +2065,26 @@ mod tests {
     }
 
     /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the render took its own maths (fm, 2026-10-29: a step of one 8-bit level on a few pixels; the same on every platform from here), pinned again 2026-11-01 for even placement with no framing test, and again the same day for colour picked in VSF RGB and metals from their spectra (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
+
+    /// The attest button as ahau draws it (one sample and the 4 x 4 fine pass), hashed: the orbit's loop through `Lane::iterate` must leave it bit for bit (2026-11-05).
+    #[test]
+    fn attest_mark_holds_still() {
+        let mut h = blake3::Hasher::new();
+        for device in 0u32..(1 << 2) {
+            let salt = *blake3::hash(&device.to_le_bytes()).as_bytes();
+            let p = Params::new_placed(&salt, "handle", true);
+            let r = 40usize;
+            let side = 2 * r + 4;
+            for k in [1u32, 4] {
+                let mut buf = vec![0u64; side * side];
+                render_button_pack16(&mut buf, side, side as f32 * 0.5, side as f32 * 0.5, r as f32, &p, &Look::attest(), k, (0, 1), &|| false);
+                for w in &buf {
+                    h.update(&w.to_le_bytes());
+                }
+            }
+        }
+        assert_eq!(h.finalize().to_hex().as_str(), "8ad835fa14e7adc0e226c03f894118872d97c985d16fe439391e5db331f6a826");
+    }
     #[test]
     fn avatars_hold_still() {
         let mut h = blake3::Hasher::new();
