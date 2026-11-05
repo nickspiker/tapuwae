@@ -112,6 +112,26 @@ pub fn button_quick_kernel(r: f32, p: &Params, look: &Look) -> Compiled {
     ssa::compile()
 }
 
+/// The quick pass over the circle's staged coordinates (`button_stage`): invocation g draws staged pixel g as `button_quick_kernel` draws it, and nothing outside the circle is computed at all (~22 % of the square; the caller zeroes those pixels once). Uniforms: 0 the frame, 1 the stage. Run it with (staged count / 16) workgroups of 16.
+pub fn button_quick_staged_kernel(r: f32, p: &Params, look: &Look) -> Compiled {
+    let bt = Button::new(p, look, r);
+    let side = 2. * r + 4.;
+    let c = side * 0.5;
+    ssa::begin();
+    ssa::reserve(2);
+    let g = ssa::gid();
+    let idx = ssa::load(1, g, 2, 0);
+    let fi = F::from_u32(idx);
+    let py = ((fi + 0.5) / side).floor();
+    let px = fi - py * side;
+    let (rgb, a) = bt.sample(px + 0.5 - c, py + 0.5 - c);
+    let q = (1u32 << 14) as f32;
+    let ch = |v: F| (v * a * q + 0.5).to_u32();
+    ssa::store_at(0, idx, 3, 0, ch(rgb[0]) | ch(rgb[1]) << 16);
+    ssa::store_at(0, idx, 3, 4, ch(rgb[2]) | (a * q + 0.5).to_u32() << 16);
+    ssa::compile()
+}
+
 /// The circle's staged coordinates (owner, 2026-11-05: "a stage of all the coordinates in the circle, then only execute the ones in the circle"): the index (py · side + px) of every pixel of the button's square that `render_button_pack16` draws (its centre within r + 1 of the square's), in row order. Every other pixel stays as the quick pass left it, 0.
 pub fn button_stage(r: f32, mut f: impl FnMut(u32)) {
     let side = 2 * r as usize + 4;
