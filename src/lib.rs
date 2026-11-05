@@ -1293,6 +1293,11 @@ pub fn render_disc_counted(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, 
     disc_into(buf, w, cx, cy, r, p, look, pack)
 }
 
+/// As `render_disc`, into ferros's 16-bit surface pixels (`pack16`, the pixels `render_fresh` writes): what ahau's attest screen blits.
+pub fn render_disc_pack16(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) {
+    disc_into(buf, w, cx, cy, r, p, look, pack16);
+}
+
 /// As `render_disc`, into fluor's 16-bit `G2t16` pixels (`pack_g2t16`): the same samples, the same edge, each pixel's colour kept at 16 bits of `g2t` instead of 8 bits of gamma 2.
 pub fn render_disc_g2t16(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) {
     disc_into(buf, w, cx, cy, r, p, look, pack_g2t16);
