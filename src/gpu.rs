@@ -132,6 +132,31 @@ pub fn button_quick_staged_kernel(r: f32, p: &Params, look: &Look) -> Compiled {
     ssa::compile()
 }
 
+/// For measuring only (2026-11-05: where the quick pass's time goes): the quick pass over the stage with the ball's warp and `orbit` alone, no `shade`, the escape count stored. Its time against `button_quick_staged_kernel`'s is the shading's share.
+pub fn button_orbit_only_kernel(r: f32, p: &Params, look: &Look) -> Compiled {
+    let bt = Button::new(p, look, r);
+    let side = 2. * r + 4.;
+    let c = side * 0.5;
+    ssa::begin();
+    ssa::reserve(2);
+    let g = ssa::gid();
+    let idx = ssa::load(1, g, 2, 0);
+    let fi = F::from_u32(idx);
+    let py = ((fi + 0.5) / side).floor();
+    let px = fi - py * side;
+    let (sx, sy) = ((px + 0.5 - c) / bt.r, (py + 0.5 - c) / bt.r);
+    let q = (sx / crate::BALL, sy / crate::BALL);
+    let (v, one) = (&bt.v, F::splat(1.));
+    let q2 = q.0 * q.0 + q.1 * q.1;
+    let gw = F::splat(bt.rad) / (one - q2).sqrt_rounded();
+    let (a, b) = (q.0 * gw, q.1 * gw);
+    let (x, y) = (a * v.rot.0 + v.centre.0 - b * v.rot.1, a * v.rot.1 + v.centre.1 + b * v.rot.0);
+    let o = crate::orbit(x, y, v);
+    ssa::store_at(0, idx, 3, 0, o.n.to_bits());
+    ssa::store_at(0, idx, 3, 4, o.dm.to_bits());
+    ssa::compile()
+}
+
 /// The circle's staged coordinates (owner, 2026-11-05: "a stage of all the coordinates in the circle, then only execute the ones in the circle"): the index (py · side + px) of every pixel of the button's square that `render_button_pack16` draws (its centre within r + 1 of the square's), in row order. Every other pixel stays as the quick pass left it, 0.
 pub fn button_stage(r: f32, mut f: impl FnMut(u32)) {
     let side = 2 * r as usize + 4;
@@ -192,19 +217,24 @@ pub fn button_fine_kernel(r: f32, p: &Params, look: &Look, m: u32) -> Compiled {
 mod tests {
     use super::*;
 
+    /// The recorder is one global per program (the device compiles on one thread at a time), so the tests that record take turns.
+    static RECORDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The quick pass records and compiles (on the host as on the device: the recorder is plain Rust): its size and its registers.
     #[test]
     fn the_quick_pass_compiles() {
+        let _turn = RECORDING.lock().unwrap();
         let salt = *blake3::hash(b"gpu").as_bytes();
         let p = Params::new_placed(&salt, "handle", true);
         let k = button_quick_kernel(448., &p, &Look::attest());
-        println!("QUICK_KERNEL {} words, 64 registers {}, {} nodes recorded, {} kept, {} registers at the peak; the loop {} words, {} of them constant loads; {} uniform slots of constants", k.words.len(), k.regs64, k.nodes, k.kept, k.peak, k.loop_words, k.loop_consts, k.consts.len());
+        println!("QUICK_KERNEL {} words, 64 registers {}, {} nodes recorded, {} kept, {} registers at the peak; the loop {} words, {} of them constant loads; {} uniform slots of constants; kinds {:?}", k.words.len(), k.regs64, k.nodes, k.kept, k.peak, k.loop_words, k.loop_consts, k.consts.len(), k.kinds);
         assert!(!k.words.is_empty());
     }
 
     /// A fine pass records and compiles too.
     #[test]
     fn a_fine_pass_compiles() {
+        let _turn = RECORDING.lock().unwrap();
         let salt = *blake3::hash(b"gpu").as_bytes();
         let p = Params::new_placed(&salt, "handle", true);
         for m in [0, 7, 15] {

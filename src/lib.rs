@@ -166,9 +166,12 @@ struct Carry<L: Lane> {
     fq_w: L,
     fc: (L, L),
     fc_w: L,
-    lv: L,
-    ray: L,
-    ln_turn: L,
+    /// Where the orbit first passed |z|² = 2⁸ (ENGRAVE_SQ), as the loop found it: the pass, |z|², z, and the derivative's magnitude and exponent then. The engraving's level, angle and turn are worked out from these once, after the loop (they took two logs and an atan2 on every pass of a GPU invocation, which runs every guarded block).
+    e_n: L,
+    e_r2: L,
+    e_z: (L, L),
+    e_dm: L,
+    e_exp: L,
     engraved: L::M,
     running: L::M,
     n_esc: L,
@@ -218,9 +221,9 @@ fn orbit<L: Lane>(px: L, py: L, v: &View) -> Orbit<L> {
     let lnln_bail = BAIL_SQ_F32.fln().fln();
     let ln_2ln2 = (2. * 2f32.fln()).fln();
     let dm_exp = zero;
-    let (lv, ray, ln_turn, engraved) = (zero, zero, zero, L::M::splat(false));
+    let engraved = L::M::splat(false);
     // The lanes still iterating, and the iteration each escaped at; the loop through `Lane::iterate` (the head up to where a lane that escapes leaves, the tail after it), so a GPU lane type records it once.
-    let s = Carry { z, plus, dm, dm_exp, dir, trap_sq, fq, fq_w, fc, fc_w, lv, ray, ln_turn, engraved, running: L::M::splat(true), n_esc: L::splat(MAX_ITER as f32), x2: zero, y2: zero, r2: zero };
+    let s = Carry { z, plus, dm, dm_exp, dir, trap_sq, fq, fq_w, fc, fc_w, e_n: zero, e_r2: zero, e_z: (zero, zero), e_dm: zero, e_exp: zero, engraved, running: L::M::splat(true), n_esc: L::splat(MAX_ITER as f32), x2: zero, y2: zero, r2: zero };
     let s = L::iterate(
         MAX_ITER,
         s,
@@ -240,9 +243,11 @@ fn orbit<L: Lane>(px: L, py: L, v: &View) -> Orbit<L> {
             let first = running & !s.engraved & r2.gt(L::splat(ENGRAVE_SQ));
             if first.any() {
                 s.engraved = s.engraved | first;
-                s.lv = select(first, n + 1. - (r2.fln() / ENGRAVE_SQ.fln()).flog2(), s.lv);
-                s.ray = select(first, z.1.fatan2(z.0) * (1. / TAU as f32), s.ray);
-                s.ln_turn = select(first, s.dm.fln() + s.dm_exp * core::f32::consts::LN_2 - r2.fln() * 0.5, s.ln_turn);
+                s.e_n = select(first, n, s.e_n);
+                s.e_r2 = select(first, r2, s.e_r2);
+                s.e_z = select(first, z, s.e_z);
+                s.e_dm = select(first, s.dm, s.e_dm);
+                s.e_exp = select(first, s.dm_exp, s.e_exp);
             }
             let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
             s.trap_sq = live::<L, _>(running, s.trap_sq.min(tx * tx + ty * ty), s.trap_sq);
@@ -280,7 +285,13 @@ fn orbit<L: Lane>(px: L, py: L, v: &View) -> Orbit<L> {
             s
         },
     );
-    let Carry { z, dm, dm_exp, dir, trap_sq, fq, fq_w, fc, fc_w, lv, ray, ln_turn, n_esc, .. } = s;
+    let Carry { z, dm, dm_exp, dir, trap_sq, fq, fq_w, fc, fc_w, e_n, e_r2, e_z, e_dm, e_exp, engraved, n_esc, .. } = s;
+    // The engraving at the crossing, from what the loop kept there: the same arithmetic on the same values the crossing pass used to work it out with.
+    let (lv, ray, ln_turn) = pick(
+        engraved,
+        || (e_n + 1. - (e_r2.fln() / ENGRAVE_SQ.fln()).flog2(), e_z.1.fatan2(e_z.0) * (1. / TAU as f32), e_dm.fln() + e_exp * core::f32::consts::LN_2 - e_r2.fln() * 0.5),
+        (zero, zero, zero),
+    );
     let escaped = n_esc.lt(L::splat(MAX_ITER as f32));
     // u = z / dz, as a direction: z/|z| times the conjugate of dz's direction.
     let (ux, uy) = if julia {
