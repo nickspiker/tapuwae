@@ -110,6 +110,62 @@ pub fn button_quick_kernel(r: f32, p: &Params, look: &Look) -> Compiled {
     ssa::compile()
 }
 
+/// The circle's staged coordinates (owner, 2026-11-05: "a stage of all the coordinates in the circle, then only execute the ones in the circle"): the index (py · side + px) of every pixel of the button's square that `render_button_pack16` draws (its centre within r + 1 of the square's), in row order. Every other pixel stays as the quick pass left it, 0.
+pub fn button_stage(r: f32, mut f: impl FnMut(u32)) {
+    let side = 2 * r as usize + 4;
+    let c = side as f32 * 0.5;
+    for py in 0..side {
+        for px in 0..side {
+            let (dx, dy) = (px as f32 + 0.5 - c, py as f32 + 0.5 - c);
+            if dx * dx + dy * dy < (r + 1.) * (r + 1.) {
+                f((py * side + px) as u32);
+            }
+        }
+    }
+}
+
+/// Pass `m` (0 to 15) of the button's 4 × 4 pass, each pass distinct (owner, 2026-11-05): invocation g takes staged pixel g (`button_stage`), its m-th stratified, jittered sample exactly as `render_button_pack16` places it, adds c² · a and a to that pixel's sums in sample order (pass 0 starts them), and writes the pixel as the sums so far stand, coverage over m + 1 samples: after pass 15, the CPU's 4 × 4 pixel.
+/// Uniforms: 0 the frame (side × side pack16 words), 1 the stage (u32 indices), 2 the sums (four f32 a staged pixel: R, G, B, coverage). Run it with (staged count / 16) workgroups of 16.
+pub fn button_fine_kernel(r: f32, p: &Params, look: &Look, m: u32) -> Compiled {
+    let bt = Button::new(p, look, r);
+    let side = 2. * r + 4.;
+    let c = side * 0.5;
+    let (k, kf) = (4u32, 4f32);
+    ssa::begin();
+    ssa::reserve(3);
+    let g = ssa::gid();
+    let idx = ssa::load(1, g, 2, 0);
+    let fi = F::from_u32(idx);
+    // Row and column from the index in floats: exact below 2²⁴, and (i + ½) / side is never a whole number.
+    let py = ((fi + 0.5) / side).floor();
+    let px = fi - py * side;
+    let (jx, jy) = crate::jitter::<F>(px.to_u32(), py.to_u32(), U::splat(m));
+    let (sx, sy) = ((F::splat((m % k) as f32) + jx) / kf, (F::splat((m / k) as f32) + jy) / kf);
+    let (rgb, a) = bt.sample(px + sx - c, py + sy - c);
+    let zero = F::splat(0.);
+    let (mut sum, mut cover) = if m == 0 {
+        ([zero; 3], zero)
+    } else {
+        ([0i16, 4, 8].map(|o| F::from_bits(ssa::load(2, g, 4, o))), F::from_bits(ssa::load(2, g, 4, 12)))
+    };
+    for i in 0..3 {
+        sum[i] = sum[i] + rgb[i] * rgb[i] * a;
+    }
+    cover = cover + a;
+    for (i, o) in [0i16, 4, 8].iter().enumerate() {
+        ssa::store_at(2, g, 4, *o, sum[i].to_bits());
+    }
+    ssa::store_at(2, g, 4, 12, cover.to_bits());
+    let has = cover.gt(zero);
+    let out = [0, 1, 2].map(|i| F::select(has, (sum[i] / cover).sqrt_rounded(), zero));
+    let alpha = cover / ((m + 1) as f32);
+    let q = (1u32 << 14) as f32;
+    let ch = |v: F| (v * alpha * q + 0.5).to_u32();
+    ssa::store_at(0, idx, 3, 0, ch(out[0]) | ch(out[1]) << 16);
+    ssa::store_at(0, idx, 3, 4, ch(out[2]) | (alpha * q + 0.5).to_u32() << 16);
+    ssa::compile()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,7 +176,18 @@ mod tests {
         let salt = *blake3::hash(b"gpu").as_bytes();
         let p = Params::new_placed(&salt, "handle", true);
         let k = button_quick_kernel(448., &p, &Look::attest());
-        println!("QUICK_KERNEL {} words, 64 registers {}, {} nodes recorded, {} kept, {} registers at the peak", k.words.len(), k.regs64, k.nodes, k.kept, k.peak);
+        println!("QUICK_KERNEL {} words, 64 registers {}, {} nodes recorded, {} kept, {} registers at the peak; the loop {} words, {} of them constant loads; {} uniform slots of constants", k.words.len(), k.regs64, k.nodes, k.kept, k.peak, k.loop_words, k.loop_consts, k.consts.len());
         assert!(!k.words.is_empty());
+    }
+
+    /// A fine pass records and compiles too.
+    #[test]
+    fn a_fine_pass_compiles() {
+        let salt = *blake3::hash(b"gpu").as_bytes();
+        let p = Params::new_placed(&salt, "handle", true);
+        for m in [0, 7, 15] {
+            let k = button_fine_kernel(448., &p, &Look::attest(), m);
+            println!("FINE_KERNEL pass {m}: {} words, 64 registers {}, peak {}, {} constant slots", k.words.len(), k.regs64, k.peak, k.consts.len());
+        }
     }
 }
