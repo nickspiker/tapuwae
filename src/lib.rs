@@ -1387,43 +1387,13 @@ const BALL: f32 = GLOW_FRACTION / (GLOW_FRACTION + 1.);
 /// The ball is opaque and the glow is light over the background (coverage = its brightness), so samples are averaged with their coverage (premultiplied, in linear light); pixels across the ball's edge take at least 2³ samples, since a sharp circle can fall between two jittered samples on one side.
 #[allow(clippy::too_many_arguments)]
 fn render_button<T: Copy + Send + From<u8>>(buf: &mut [T], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look, pack: fn([f32; 3], f32) -> T) -> Vec<u64> {
-    let v = mirrored(p.view(), look);
-    let r_pic = r * BALL;
-    let hair = r_pic * (1. / (1 << 7) as f32);
-    let rad = p.radius as f32;
-    let aura = soft(&v.theme, 0.72, 0.15, 0., (0., 0.));
-    let b2 = BALL * BALL;
-    // Where the glow ends (the disc's edge) in q, and how many octaves of q it fades over.
-    let q_end = 1. - b2;
-    let octaves = (1 << GLOW_OCTAVES_LOG2) as f32;
+    let bt = Button::new(p, look, r);
     // One sample at (dx, dy) pixels from the centre: its colour (display gamma) and its coverage.
     let sample = |dx: f32, dy: f32| -> ([f32; 3], f32) {
-        let (sx, sy) = (dx / r, dy / r);
-        let s2 = sx * sx + sy * sy;
-        if s2 >= 1. {
-            return ([0.; 3], 0.);
+        match bt.at(dx, dy) {
+            Spot::Plain(c, a) => (c, a),
+            Spot::Ball(q) => (bt.ball::<f32>((q.0, q.1)), 1.),
         }
-        // Where the sample falls against the ball, as one ratio (|p|² in the ball's units), so the glow and the ball split on the same number.
-        // WHY: the edge itself must belong to neither side's singularity. Tested apart (s2 ≥ b2 for the glow, then (sx/BALL)² + (sy/BALL)² for the ball), a sample exactly on the edge took log₂(0) = −∞ in the glow (its soft clamp then gave ∞ − ∞) and one a rounding inside it took 1/√(1 − q2) with q2 rounded to 1; either NaN poisoned its pixel's whole sum (measured: about one pixel in 2¹⁰ on the rim at 2¹⁰ samples, 2026-10-29).
-        let q2 = s2 / b2;
-        if q2 > 1. {
-            // q2 > 1 means s2 > b2 exactly, so the log is finite. u: 0 at q_end/2⁴ (full light holds inside it), 1 at q_end; the light 1 − u between, softly 1 before and 0 after.
-            let u = 1. + (s2 - b2).flog2() / octaves - q_end.flog2() / octaves;
-            let light = (positive_part(1. - u) - positive_part(-u)) * (1. - s2.powi(1 << 3));
-            return (aura, light);
-        }
-        // On the rim itself the warp is infinite and the taper is 0: only the device's colour shows.
-        if q2 == 1. {
-            return (aura, 1.);
-        }
-        let (qx, qy) = (sx / BALL, sy / BALL);
-        let g = rad / (1. - q2).sqrt();
-        let (a, b) = (qx * g, qy * g);
-        let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
-        let k = rad / (r_pic * (1. - q2));
-        let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
-        let c = shade(x, y, &v, k, look, (qx, qy, (1. - q2).sqrt()), hair, (1., 0.)).0;
-        ([0, 1, 2].map(|i| aura[i] + (c[i] - aura[i]) * taper), 1.)
     };
     let e_out = r * BALL;
     // The fewest samples a pixel takes before it may stop (doubling passes).
@@ -1505,6 +1475,173 @@ fn render_button<T: Copy + Send + From<u8>>(buf: &mut [T], w: usize, cx: f32, cy
         })
         ;
     add_rows!(hists, vec![0u64; cap + 1])
+}
+
+/// The button's geometry and colours, worked out once a render: what `render_button` and `render_button_pack16` both sample.
+struct Button<'a> {
+    v: View,
+    look: &'a Look,
+    r: f32,
+    r_pic: f32,
+    rad: f32,
+    aura: [f32; 3],
+    b2: f32,
+    // Where the glow ends (the disc's edge) in q, and how many octaves of q it fades over.
+    q_end: f32,
+    octaves: f32,
+}
+
+/// Where a button sample falls: somewhere needing no orbit (outside, the glow, the rim), as its colour (display gamma) and coverage; or on the ball, as its disc point.
+enum Spot {
+    Plain([f32; 3], f32),
+    Ball((f32, f32)),
+}
+
+impl<'a> Button<'a> {
+    fn new(p: &Params, look: &'a Look, r: f32) -> Self {
+        let v = mirrored(p.view(), look);
+        let aura = soft(&v.theme, 0.72, 0.15, 0., (0., 0.));
+        let b2 = BALL * BALL;
+        Button { v, look, r, r_pic: r * BALL, rad: p.radius as f32, aura, b2, q_end: 1. - b2, octaves: (1 << GLOW_OCTAVES_LOG2) as f32 }
+    }
+
+    /// The sample at (dx, dy) pixels from the centre.
+    #[inline]
+    fn at(&self, dx: f32, dy: f32) -> Spot {
+        let (sx, sy) = (dx / self.r, dy / self.r);
+        let s2 = sx * sx + sy * sy;
+        if s2 >= 1. {
+            return Spot::Plain([0.; 3], 0.);
+        }
+        // Where the sample falls against the ball, as one ratio (|p|² in the ball's units), so the glow and the ball split on the same number.
+        // WHY: the edge itself must belong to neither side's singularity. Tested apart (s2 ≥ b2 for the glow, then (sx/BALL)² + (sy/BALL)² for the ball), a sample exactly on the edge took log₂(0) = −∞ in the glow (its soft clamp then gave ∞ − ∞) and one a rounding inside it took 1/√(1 − q2) with q2 rounded to 1; either NaN poisoned its pixel's whole sum (measured: about one pixel in 2¹⁰ on the rim at 2¹⁰ samples, 2026-10-29).
+        let q2 = s2 / self.b2;
+        if q2 > 1. {
+            // q2 > 1 means s2 > b2 exactly, so the log is finite. u: 0 at q_end/2⁴ (full light holds inside it), 1 at q_end; the light 1 − u between, softly 1 before and 0 after.
+            let u = 1. + (s2 - self.b2).flog2() / self.octaves - self.q_end.flog2() / self.octaves;
+            let light = (positive_part(1. - u) - positive_part(-u)) * (1. - s2.powi(1 << 3));
+            return Spot::Plain(self.aura, light);
+        }
+        // On the rim itself the warp is infinite and the taper is 0: only the device's colour shows.
+        if q2 == 1. {
+            return Spot::Plain(self.aura, 1.);
+        }
+        Spot::Ball((sx / BALL, sy / BALL))
+    }
+
+    /// The ball's colour (display gamma) at disc point q (|q| < 1), one sample or four (`Lane`): spherized, shaded, tapering into the device's colour at the rim by the look's vignette.
+    #[inline]
+    fn ball<L: Lane>(&self, q: (L, L)) -> [L; 3] {
+        let (v, one) = (&self.v, L::splat(1.));
+        let q2 = q.0 * q.0 + q.1 * q.1;
+        // The rounded root, as `ball` (the fresh mark's) takes it: the plane point starts a chaotic orbit, where an ulp moves the whole escape.
+        let g = L::splat(self.rad) / (one - q2).sqrt_rounded();
+        let (a, b) = (q.0 * g, q.1 * g);
+        let (x, y) = (a * v.rot.0 + v.centre.0 - b * v.rot.1, a * v.rot.1 + v.centre.1 + b * v.rot.0);
+        let k = L::splat(self.rad) / ((one - q2) * self.r_pic);
+        let taper = (one - q2.powi(self.look.vignette / 2)).sqrt();
+        let c = shade(x, y, v, k, self.look, (q.0, q.1, (one - q2).sqrt()), L::splat(self.r_pic * (1. / (1 << 7) as f32)), (one, L::splat(0.))).0;
+        [0, 1, 2].map(|i| (c[i] - self.aura[i]) * taper + self.aura[i])
+    }
+}
+
+/// The button (`render_button`'s picture) into ferros's 16-bit surface pixels (`pack16`), fast enough to follow typing: the ball's samples go four to a lane call, as `render_fresh` shades its components, where `render_button` takes them one at a time; the glow's and the rim's need no orbit and go one by one.
+/// `k` = 1 is the quick pass, one sample at each pixel's centre, the ball's pixels gathered four to a call; k > 1 is a k × k stratified grid a pixel (k up to 2³), each pixel's ball samples gathered four to a call, averaged in linear light with coverage as `render_button` averages them.
+/// `buf` is the whole surface, `w` wide; only the disc's square is written, and of it only this call's share of the rows, `rows` = (first, step): every step-th row from the square's first + first, so `step` calls on as many cores, one for each first in 0..step, draw the whole disc between them, each row by one only (interleaved rather than in blocks: the ball's middle rows cost more than its edge's, and interleaving gives every core its share of both). `stop` is asked before every row: true leaves the pass where it is and returns false (a newer handle is waiting); a finished pass returns true.
+#[allow(clippy::too_many_arguments)]
+pub fn render_button_pack16(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look, k: u32, rows: (usize, usize), stop: &dyn Fn() -> bool) -> bool {
+    let bt = Button::new(p, look, r);
+    let shade4 = |qs: &[(f32, f32)]| -> [[f32; 3]; 4] {
+        // A short call fills its spare lanes with its first point (the same orbit, so it never runs longer) and drops their colours.
+        let mut at4 = [qs[0]; 4];
+        at4[..qs.len()].copy_from_slice(qs);
+        let c = bt.ball((F4(at4.map(|q| q.0)), F4(at4.map(|q| q.1))));
+        [0, 1, 2, 3].map(|n| [c[0].0[n], c[1].0[n], c[2].0[n]])
+    };
+    let (x0, x1) = ((cx - r - 1.) as usize, (cx + r + 2.) as usize);
+    let (y0, y1) = ((cy - r - 1.) as usize, (cy + r + 2.) as usize);
+    let (kf, kk2) = (k as f32, (k * k) as usize);
+    // The quick pass's ball pixels waiting for a lane call: (pixel, disc point).
+    let mut pend = [(0usize, (0f32, 0f32)); 4];
+    let mut np = 0;
+    let flush = |pend: &[(usize, (f32, f32))], buf: &mut [u64]| {
+        if pend.is_empty() {
+            return;
+        }
+        let mut qs = [pend[0].1; 4];
+        for (j, &(_, q)) in pend.iter().enumerate() {
+            qs[j] = q;
+        }
+        let cols = shade4(&qs[..pend.len()]);
+        for (j, &(i, _)) in pend.iter().enumerate() {
+            buf[i] = pack16(cols[j], 1.);
+        }
+    };
+    for py in (y0 + rows.0..y1).step_by(rows.1) {
+        if stop() {
+            return false;
+        }
+        for px in x0..x1 {
+            let i = py * w + px;
+            let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+            if dx * dx + dy * dy >= (r + 1.) * (r + 1.) {
+                buf[i] = 0;
+                continue;
+            }
+            if k == 1 {
+                match bt.at(dx, dy) {
+                    Spot::Plain(c, a) => buf[i] = pack16(c, a),
+                    Spot::Ball(q) => {
+                        pend[np] = (i, q);
+                        np += 1;
+                        if np == 4 {
+                            flush(&pend, buf);
+                            np = 0;
+                        }
+                    }
+                }
+                continue;
+            }
+            // The m-th sample in cell (m mod k, m div k) of the k × k grid, jittered within it as `render_button`'s stratified samples are; in sample order so they add up as they always did.
+            let mut cols = [([0f32; 3], 0f32); 1 << 6];
+            let mut balls = [(0usize, (0f32, 0f32)); 1 << 6];
+            let mut nb = 0;
+            for m in 0..kk2 {
+                let (jx, jy) = jitter::<f32>(px as u32, py as u32, m as u32);
+                let mu = m as u32;
+                let (sx, sy) = (((mu % k) as f32 + jx) / kf, ((mu / k) as f32 + jy) / kf);
+                match bt.at(px as f32 + sx - cx, py as f32 + sy - cy) {
+                    Spot::Plain(c, a) => cols[m] = (c, a),
+                    Spot::Ball(q) => {
+                        balls[nb] = (m, q);
+                        nb += 1;
+                    }
+                }
+            }
+            for chunk in balls[..nb].chunks(4) {
+                let mut qs = [chunk[0].1; 4];
+                for (j, &(_, q)) in chunk.iter().enumerate() {
+                    qs[j] = q;
+                }
+                let c = shade4(&qs[..chunk.len()]);
+                for (j, &(m, _)) in chunk.iter().enumerate() {
+                    cols[m] = (c[j], 1.);
+                }
+            }
+            let mut sum = [0f32; 3];
+            let mut cover = 0f32;
+            for &(s, a) in &cols[..kk2] {
+                for i in 0..3 {
+                    sum[i] += s[i] * s[i] * a;
+                }
+                cover += a;
+            }
+            let rgb = if cover > 0. { sum.map(|c| (c / cover).sqrt()) } else { [0.; 3] };
+            buf[i] = pack16(rgb, cover / kk2 as f32);
+        }
+    }
+    flush(&pend[..np], buf);
+    true
 }
 
 /// The view as the look shows it: mirrored (attest) is the conjugate picture, J(c̄) about the eye's conjugate turned the other way, which is the plain one flipped top to bottom with its whorl turning the other way; the lamps stay where they are.
