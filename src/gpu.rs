@@ -4,7 +4,9 @@
 
 use crate::lanes::{Bits, Lane, Mask};
 use crate::{Button, Look, Params};
-use valhall::ssa::{self, Compiled, F, M, U};
+use valhall::ssa::{self, F, M, U};
+/// What a kernel compiles to (valhall's), for a caller that runs it.
+pub use valhall::ssa::Compiled;
 
 impl Mask for M {
     fn splat(b: bool) -> M {
