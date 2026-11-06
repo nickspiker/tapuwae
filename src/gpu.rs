@@ -158,16 +158,22 @@ pub fn button_orbit_only_kernel(r: f32, p: &Params, look: &Look) -> Compiled {
 }
 
 /// The circle's staged coordinates (owner, 2026-11-05: "a stage of all the coordinates in the circle, then only execute the ones in the circle"): the index (py · side + px) of every pixel of the button's square that `render_button_pack16` draws (its centre within r + 1 of the square's), in row order. Every other pixel stays as the quick pass left it, 0.
+/// Padded to whole workgroups of 16 with pixel 0, a corner well outside the circle, which the kernels draw as the CPU leaves it (coverage 0, the word 0): the GPU runs every invocation of the last group, and those past the list read whatever lay beyond it as a pixel index (2026-11-05: after another job left words there, the r = 448 quick pass stored outside the arena and never finished).
 pub fn button_stage(r: f32, mut f: impl FnMut(u32)) {
     let side = 2 * r as usize + 4;
     let c = side as f32 * 0.5;
+    let mut n = 0usize;
     for py in 0..side {
         for px in 0..side {
             let (dx, dy) = (px as f32 + 0.5 - c, py as f32 + 0.5 - c);
             if dx * dx + dy * dy < (r + 1.) * (r + 1.) {
                 f((py * side + px) as u32);
+                n += 1;
             }
         }
+    }
+    for _ in n..n.next_multiple_of(16) {
+        f(0);
     }
 }
 
