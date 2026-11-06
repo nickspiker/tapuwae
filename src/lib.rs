@@ -350,9 +350,25 @@ fn address_point(c: (f64, f64), bits: &[u8; 32]) -> (f64, f64) {
     z
 }
 
-/// J(c)'s half-extent along its principal axis, from 2⁷ address points (J = −J, so its centre is 0).
-fn j_extent(c: (f64, f64)) -> f64 {
-    let pts: Vec<(f64, f64)> = (0u32..(1 << 7)).map(|i| address_point(c, blake3::hash(&i.to_le_bytes()).as_bytes())).collect();
+/// How many address points `j_extent` takes.
+pub const EXTENT_POINTS: usize = 1 << 7;
+
+/// Address point `i` of J(c) for `j_extent` (its address the hash of i): independent of the others, so a caller with threads can fill them side by side (`Params::new_placed_with`).
+pub fn extent_point(c: (f64, f64), i: u32) -> (f64, f64) {
+    address_point(c, blake3::hash(&i.to_le_bytes()).as_bytes())
+}
+
+/// The address points one after another.
+pub fn extent_points_in_turn(c: (f64, f64), pts: &mut [(f64, f64); EXTENT_POINTS]) {
+    for (i, p) in pts.iter_mut().enumerate() {
+        *p = extent_point(c, i as u32);
+    }
+}
+
+/// J(c)'s half-extent along its principal axis, from 2⁷ address points (J = −J, so its centre is 0); `fill` puts point i in slot i.
+fn j_extent(c: (f64, f64), fill: &mut dyn FnMut((f64, f64), &mut [(f64, f64); EXTENT_POINTS])) -> f64 {
+    let mut pts = [(0f64, 0f64); EXTENT_POINTS];
+    fill(c, &mut pts);
     let (mut sxx, mut syy, mut sxy) = (0., 0., 0.);
     for p in &pts {
         sxx += p.0 * p.0;
@@ -678,6 +694,11 @@ impl Params {
 
     /// As `new`, choosing whether the key's continuous choices (the descent's x, c's height, the whorl's zoom and the turn) walk progressively from the device's own (`progressive`, see `walk`) or are drawn afresh for every key; either way x is slanted toward the right (see the crate's doc).
     pub fn new_placed(salt: &[u8; 32], text: &str, progressive: bool) -> Self {
+        Self::new_placed_with(salt, text, progressive, &mut extent_points_in_turn)
+    }
+
+    /// As `new_placed`, with J(c)'s address points (half the work here: 2⁷ points of 2⁸ inverse steps) filled by `fill`, point i in slot i ([`extent_point`]): a caller with idle threads splits them (ferros ahau, 2026-11-05). The same points summed in the same order, so the same picture.
+    pub fn new_placed_with(salt: &[u8; 32], text: &str, progressive: bool, fill: &mut dyn FnMut((f64, f64), &mut [(f64, f64); EXTENT_POINTS])) -> Self {
         let f = draw(salt, 1, 0, &[]);
         let span = X_RIGHT + 2.;
         // A key's continuous choices: progressive (`walk`) or each key free.
@@ -697,7 +718,7 @@ impl Params {
         let x = -2. + pick(16, n, false) * span;
         let (land, _, _) = descend(x);
         let c = (land.0, land.1 + (-(4. + pick(17, n, false) * HEIGHT_STOPS as f64)).exp2());
-        let along = j_extent(c);
+        let along = j_extent(c, fill);
         // Every key sits on the ROOT whorl's eye, dead centre, never a preimage of it (a preimage is a smaller copy: a sub-spiral).
         // The root is the cycle closest to neutral (smallest ln|λ|): it turns slowest and grows slowest, so its whorl is the largest in the picture. Candidates: the cycle of the component beneath the landing (`root_cycle`, near-neutral when that component is close, and losing on its own when it is far), the α fixed point in closed form (the root near the main cardioid), and 2⁵ sprayed cycles of periods 1 to 2⁴.
         // The hash picks which of the cycle's own points to sit on: each is a root, mapped onto the next by f.
