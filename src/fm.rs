@@ -28,10 +28,22 @@ fn exp2_frac<L: Lane>(f: L) -> L {
     horner(f * LN_2, [1., 1., 1. / 2., 1. / 6., 1. / 24., 1. / 120., 1. / 720.])
 }
 
+/// 2ˣ, through the lane's hook (`Lane::exp2_lane`): the polynomial below on the CPU, the GPU's own unit there.
+#[inline(always)]
+pub fn exp2<L: Lane>(x: L) -> L {
+    x.exp2_lane()
+}
+
+/// log₂ x, through the lane's hook (`Lane::log2_lane`), as `exp2`.
+#[inline(always)]
+pub fn log2<L: Lane>(x: L) -> L {
+    x.log2_lane()
+}
+
 /// 2ˣ: the integer part straight into the exponent bits, the fraction from the polynomial.
 /// WHY the bounds on x: the exponent field holds −126 to 127; past them the bits would wrap into garbage, so x is held to [−126, 127], where 2ˣ is already 0 or the largest power to every use here (the shading's exp2(−d²) falls off to nothing long before).
 #[inline(always)]
-pub fn exp2<L: Lane>(x: L) -> L {
+pub fn exp2_poly<L: Lane>(x: L) -> L {
     let x = x.max(L::splat(-126.)).min(L::splat(127.));
     let n = round(x);
     // n + 127 is a whole number in [1, 254], exact as a float: the biased exponent.
@@ -47,7 +59,7 @@ pub fn exp<L: Lane>(x: L) -> L {
 
 /// log₂ x for x > 0 (and −∞ at 0, as the exponent field gives it): the exponent from the bits, the mantissa folded into [√½, √2) and its log from atanh, log₂ m = (2/ln 2)·(t + t³/3 + t⁵/5 + t⁷/7) with t = (m − 1)/(m + 1), |t| ≤ 0.172.
 #[inline(always)]
-pub fn log2<L: Lane>(x: L) -> L {
+pub fn log2_poly<L: Lane>(x: L) -> L {
     let bits = x.to_bits();
     // The exponent, a whole number, exact as a float.
     let e = L::from_u32((bits >> 23) & L::U::splat(255)) - 127.;

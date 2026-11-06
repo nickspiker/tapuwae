@@ -37,6 +37,13 @@ impl Lane for F {
     fn sqrt(self) -> F {
         F::sqrt(self)
     }
+    // The special function unit's 2ˣ and log₂ (Mesa's sequences, within an ulp on the device: ferros gputest 12), three and four instructions where the polynomials took about fifteen and twenty.
+    fn exp2_lane(self) -> F {
+        F::exp2_hw(self)
+    }
+    fn log2_lane(self) -> F {
+        F::log2_hw(self)
+    }
     fn sqrt_rounded(self) -> F {
         F::sqrt_rounded(self)
     }

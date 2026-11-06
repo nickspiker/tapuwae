@@ -66,6 +66,15 @@ pub trait Lane: Copy + Add<Output = Self> + Sub<Output = Self> + Mul<Output = Se
     fn to_i32(self) -> Self::U;
     /// `u as f32`.
     fn from_u32(u: Self::U) -> Self;
+    /// 2ˣ and log₂ x, as hooks: the render's own polynomials (`fm`) by default, identical on every CPU; a GPU lane type puts its special function unit there (ferros valhall: within an ulp, a fraction of the instructions).
+    #[inline(always)]
+    fn exp2_lane(self) -> Self {
+        crate::fm::exp2_poly(self)
+    }
+    #[inline(always)]
+    fn log2_lane(self) -> Self {
+        crate::fm::log2_poly(self)
+    }
     /// The orbit's loop, as a hook (owner, 2026-11-05: the attest mark on the GPU, one source): pass n (0 to `max` − 1, as a lane) through `head`, leave with its state when no lane is still running, otherwise through `tail`. On the CPU this is the loop the orbit always ran; a GPU lane type records `head` and `tail` once and makes the leaving a select (valhall::ssa::iterate).
     #[inline(always)]
     fn iterate<S: Copy>(max: u32, init: S, mut head: impl FnMut(Self, S) -> (S, Self::M), mut tail: impl FnMut(Self, S) -> S) -> S {
