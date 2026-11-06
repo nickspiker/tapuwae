@@ -1,6 +1,6 @@
 //! The mark on ferros's GPU (feature `gpu`; ferros GPU.md, "The resident service, and the attest mark's path"; owner, 2026-11-05).
 //! The same shading code as the CPU's, run once with valhall's recording lane type: `Lane` for `valhall::ssa::F`, whose arithmetic records a graph that valhall compiles to Mali-G715 words.
-//! One GPU invocation is one sample, but the lane type has several lanes' meaning (`live` selects), as the F4 path the CPU runs: the orbit's loop leaves through `Lane::iterate`, whose stopping pass runs the tail with the state frozen.
+//! One GPU invocation is one sample, with one lane's meaning: the orbit's loop leaves through `Lane::iterate` (valhall's), an invocation that stopped leaving right after the head as the CPU's one-lane loop does.
 
 use crate::lanes::{Bits, Lane, Mask};
 use crate::{Button, Look, Params};
@@ -27,8 +27,8 @@ impl Bits for U {
 }
 
 impl Lane for F {
-    // Several lanes' meaning, though an invocation is one sample: `live` then selects on `running`, so a stopped invocation's state stays as it was through the tail, which valhall's `iterate` needs (the pass that stops runs the tail too); the F4 code the CPU runs does exactly this.
-    const LANES: usize = 4;
+    // One lane's meaning, as an invocation is one sample: valhall's `iterate` lets an invocation that stopped leave after the head, as the CPU's one-lane loop returns, so the tail runs only where the orbit goes on and `live` needs no selects freezing the stopped ones (until 2026-11-05 four lanes' meaning, a select on `running` for every field the tail changes).
+    const LANES: usize = 1;
     type M = M;
     type U = U;
     fn splat(v: f32) -> F {
