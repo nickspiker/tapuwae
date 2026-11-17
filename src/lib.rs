@@ -1380,64 +1380,112 @@ fn disc_into<T: Copy + Send + From<u8>>(buf: &mut [T], w: usize, cx: f32, cy: f3
     let rad = p.radius as f32;
     let (r_in, r_out) = ((r - 0.5).max(0.), r + 0.5);
     let (r_in2, r_out2) = (r_in * r_in, r_out * r_out);
-    // One sample at disc offset (dx, dy) pixels from the centre: its colour (display gamma), already tapered.
-    let sample = |dx: f32, dy: f32| -> [f32; 3] {
-        let (qx, qy) = (dx / r, dy / r);
+    // Four samples at disc points q (in units of r, every |q| < 1), one in each lane: their colours (display gamma), already tapered.
+    let sample4 = |qx: F4, qy: F4| -> [F4; 3] {
+        let one = F4::splat(1.);
         let q2 = qx * qx + qy * qy;
-        // At and past the rim the taper is 0: black.
-        if q2 >= 1. {
-            return [0.; 3];
-        }
-        let g = rad / (1. - q2).sqrt();
+        // The rounded root, as the button's ball takes it: the plane point starts a chaotic orbit, where an ulp moves the whole escape.
+        let g = F4::splat(rad) / (one - q2).sqrt_rounded();
         let (a, b) = (qx * g, qy * g);
-        let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
+        let (x, y) = (a * v.rot.0 + v.centre.0 - b * v.rot.1, a * v.rot.1 + v.centre.1 + b * v.rot.0);
         // Plane units per pixel: the map's area scale, √(radial · tangential stretch) = R/(1 − |p|²) per disc unit.
-        let k = rad / (r * (1. - q2));
+        let k = F4::splat(rad) / ((one - q2) * r);
         // |p|^k as (|p|²)^(k/2): k is even in every use, so it stays a whole power.
-        let taper = (1. - q2.powi(look.vignette / 2)).sqrt();
-        shade(x, y, &v, k, look, (qx, qy, (1. - q2).sqrt()), hair, (1., 0.)).0.map(|c| c * taper)
+        let taper = (one - q2.powi(look.vignette / 2)).sqrt_rounded();
+        shade(x, y, &v, k, look, (qx, qy, (one - q2).sqrt_rounded()), F4::splat(hair), (one, F4::splat(0.))).0.map(|c| c * taper)
     };
     let hists = rows!(buf, w)
         .map(|(py, row)| {
             let mut hist = vec![0u64; MAX_SAMPLES + 1];
-            for px in 0..w {
-                let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
-                let d2 = dx * dx + dy * dy;
-                if d2 >= r_out2 {
-                    row[px] = T::from(0);
-                    continue;
-                }
-                let cover = if d2 <= r_in2 { 1. } else { (r_out2 - d2) / (r_out2 - r_in2) };
-                // Linear-light sum of the samples so far.
-                let mut sum = [0f32; 3];
-                let mut m = 0usize;
-                loop {
-                    let (jx, jy) = jitter::<f32>(px as u32, py as u32, m as u32);
-                    let s = sample(px as f32 + jx - cx, py as f32 + jy - cy);
-                    // The newest sample against the mean of the ones before it, in 8-bit display levels.
-                    let spread = if m == 0 {
-                        f32::MAX
-                    } else {
-                        let mean = sum.map(|c| (c / m as f32).sqrt());
-                        (0..3).map(|i| (s[i] - mean[i]).abs() * 255.).fold(0., f32::max)
-                    };
-                    for i in 0..3 {
-                        sum[i] += s[i] * s[i];
-                    }
-                    m += 1;
-                    // Two samples always; after that another while the last one moved by more than m − 1 levels (2 after the second, 3 after the third, …).
-                    let threshold = m as f32;
-                    if m >= MAX_SAMPLES || (m >= 2 && spread <= threshold) {
+            // Each lane works one pixel from its first sample to its last, then takes the next pixel of the row still waiting: a pixel's samples stay in order (each decides whether there is another), and four pixels' samples go through the shading together.
+            let mut lanes = [Pending::IDLE; 4];
+            let mut cursor = 0usize;
+            loop {
+                for lane in lanes.iter_mut().filter(|l| l.m == usize::MAX) {
+                    // The next pixel inside the disc's outer edge; those outside are empty.
+                    while cursor < w {
+                        let px = cursor;
+                        cursor += 1;
+                        let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+                        let d2 = dx * dx + dy * dy;
+                        if d2 >= r_out2 {
+                            row[px] = T::from(0);
+                            continue;
+                        }
+                        let cover = if d2 <= r_in2 { 1. } else { (r_out2 - d2) / (r_out2 - r_in2) };
+                        *lane = Pending { px, m: 0, sum: [0.; 3], cover };
                         break;
                     }
                 }
-                hist[m] += 1;
-                row[px] = pack(sum.map(|c| (c / m as f32).sqrt()), cover);
+                let Some(lead) = lanes.iter().position(|l| l.m != usize::MAX) else {
+                    break;
+                };
+                // Each lane's next sample, as a disc point; an idle lane repeats the lead's.
+                let (mut qx, mut qy, mut inside) = ([0f32; 4], [0f32; 4], [false; 4]);
+                for l in 0..4 {
+                    let s = if lanes[l].m == usize::MAX { &lanes[lead] } else { &lanes[l] };
+                    let (jx, jy) = jitter::<f32>(s.px as u32, py as u32, s.m as u32);
+                    let (dx, dy) = (s.px as f32 + jx - cx, py as f32 + jy - cy);
+                    (qx[l], qy[l]) = (dx / r, dy / r);
+                    // At and past the rim the taper is 0: black.
+                    inside[l] = qx[l] * qx[l] + qy[l] * qy[l] < 1.;
+                }
+                // A sample at or past the rim takes a sample inside's point (the same orbit, so the lanes run no longer) and is black; when none is inside, there is nothing to shade.
+                let cols = match inside.iter().position(|&i| i) {
+                    None => [[0f32; 3]; 4],
+                    Some(i) => {
+                        for l in 0..4 {
+                            if !inside[l] {
+                                (qx[l], qy[l]) = (qx[i], qy[i]);
+                            }
+                        }
+                        let c = sample4(F4::new(qx), F4::new(qy)).map(F4::to_array);
+                        [0, 1, 2, 3].map(|l| if inside[l] { [c[0][l], c[1][l], c[2][l]] } else { [0.; 3] })
+                    }
+                };
+                for (lane, s) in lanes.iter_mut().zip(cols) {
+                    if lane.m == usize::MAX {
+                        continue;
+                    }
+                    let (sum, m) = (&mut lane.sum, &mut lane.m);
+                    // The newest sample against the mean of the ones before it, in 8-bit display levels.
+                    let spread = if *m == 0 {
+                        f32::MAX
+                    } else {
+                        let mean = sum.map(|c| (c / *m as f32).sqrt());
+                        (0..3).map(|i| (s[i] - mean[i]).abs() * 255.).fold(0., f32::max)
+                    };
+                    // Linear-light sum of the samples so far.
+                    for i in 0..3 {
+                        sum[i] += s[i] * s[i];
+                    }
+                    *m += 1;
+                    // Two samples always; after that another while the last one moved by more than m − 1 levels (2 after the second, 3 after the third, …).
+                    let threshold = *m as f32;
+                    if *m >= MAX_SAMPLES || (*m >= 2 && spread <= threshold) {
+                        hist[*m] += 1;
+                        row[lane.px] = pack(sum.map(|c| (c / *m as f32).sqrt()), lane.cover);
+                        *lane = Pending::IDLE;
+                    }
+                }
             }
             hist
         })
         ;
     add_rows!(hists, vec![0u64; MAX_SAMPLES + 1])
+}
+
+/// A pixel a lane of the plain disc is working: its column, the samples taken (`usize::MAX` for an idle lane), their linear-light sum, and its coverage by the disc's edge.
+#[derive(Clone, Copy)]
+struct Pending {
+    px: usize,
+    m: usize,
+    sum: [f32; 3],
+    cover: f32,
+}
+
+impl Pending {
+    const IDLE: Pending = Pending { px: 0, m: usize::MAX, sum: [0.; 3], cover: 0. };
 }
 
 /// How far the button's glow reaches past the ball's edge, as a fraction of its radius: 1/12, as ferros's circles glow (payloads/display, `GLOW_FRACTION`, owner 2026-10-24); and its fade, 2^GLOW_OCTAVES_LOG2 octaves of squared distance from full light to none (four, as `GLOW_OCT_LOG2`).
@@ -1639,8 +1687,8 @@ pub fn render_button_pack16(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32,
         // A short call fills its spare lanes with its first point (the same orbit, so it never runs longer) and drops their colours.
         let mut at4 = [qs[0]; 4];
         at4[..qs.len()].copy_from_slice(qs);
-        let c = bt.ball((F4(at4.map(|q| q.0)), F4(at4.map(|q| q.1))));
-        [0, 1, 2, 3].map(|n| [c[0].0[n], c[1].0[n], c[2].0[n]])
+        let c = bt.ball((F4::new(at4.map(|q| q.0)), F4::new(at4.map(|q| q.1)))).map(F4::to_array);
+        [0, 1, 2, 3].map(|n| [c[0][n], c[1][n], c[2][n]])
     };
     let (x0, x1) = ((cx - r - 1.) as usize, (cx + r + 2.) as usize);
     let (y0, y1) = ((cy - r - 1.) as usize, (cy + r + 2.) as usize);
@@ -1858,9 +1906,9 @@ pub fn render_fresh(buf: &mut [u64], w: usize, cx: f32, cy: f32, r: f32, salt: &
     let shade4 = |cs: &[FreshCell]| -> [[f32; 3]; 4] {
         let mut at4 = [cs[0]; 4];
         at4[..cs.len()].copy_from_slice(cs);
-        let lane = |j: usize| F4(at4.map(|c| c[j] as f32));
-        let c = ball((lane(0) * (1. / q15), lane(1) * (1. / q15)), lane(2), lane(3) * (1. / (1u32 << 16) as f32), &v, rad, look, aura);
-        [0, 1, 2, 3].map(|n| [c[0].0[n], c[1].0[n], c[2].0[n]])
+        let lane = |j: usize| F4::new(at4.map(|c| c[j] as f32));
+        let c = ball((lane(0) * (1. / q15), lane(1) * (1. / q15)), lane(2), lane(3) * (1. / (1u32 << 16) as f32), &v, rad, look, aura).map(F4::to_array);
+        [0, 1, 2, 3].map(|n| [c[0][n], c[1][n], c[2][n]])
     };
     // A coarse pass's component pixels waiting for a lane call: (pixel, cell).
     let mut pend = [(0usize, [0i16; 4]); 4];
@@ -1993,7 +2041,7 @@ fn ball<L: Lane>(p: (L, L), rho: L, ang: L, v: &View, rad: f32, look: &Look, aur
     let one = L::splat(1.);
     let r_pic = (rho * (1. / (1 << 8) as f32)).fexp2();
     let q2 = p.0 * p.0 + p.1 * p.1;
-    // WHY the rounded root here alone: the sample's plane point starts an orbit that, near the set, magnifies an ulp of it into a different escape (measured: one sample in 2¹² moved by up to 42 levels with `sqrt1` here); every other root's ulp only moves a colour by as much.
+    // WHY the rounded root, named: the sample's plane point starts an orbit that, near the set, magnifies an ulp of it into a different escape (measured: one sample in 2¹² moved by up to 42 levels with a root an ulp off here, 2026-10-29); every other root's ulp only moves a colour by as much. On the CPU every root is the rounded one since 2026-11-17; the GPU's plain `sqrt` is its unit's.
     let g = L::splat(rad) / (one - q2).sqrt_rounded();
     let (a, b) = (p.0 * g, p.1 * g);
     let (x, y) = (a * v.rot.0 + v.centre.0 - b * v.rot.1, a * v.rot.1 + v.centre.1 + b * v.rot.0);
@@ -2119,7 +2167,7 @@ mod tests {
 
     /// Photon's avatars never move: eight stand-in devices' 2⁶-pixel avatars hash to what they drew once the render took its own maths (fm, 2026-10-29: a step of one 8-bit level on a few pixels; the same on every platform from here), pinned again 2026-11-01 for even placement with no framing test, and again the same day for colour picked in VSF RGB and metals from their spectra (any change to the avatar path, including a new draw from the salt that shifts an old one, fails here).
 
-    /// The attest button as ahau draws it (one sample and the 4 x 4 fine pass), hashed: the orbit's loop through `Lane::iterate` must leave it bit for bit (2026-11-05).
+    /// The attest button as ahau draws it (one sample and the 4 x 4 fine pass), hashed: the orbit's loop through `Lane::iterate` must leave it bit for bit (2026-11-05). Pinned again 2026-11-17 for the lanes' correctly rounded root (one Q14 step on 0.54% of the pixels; the lanes on core::arch alone left it bit for bit).
     #[test]
     fn attest_mark_holds_still() {
         let mut h = blake3::Hasher::new();
@@ -2136,7 +2184,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(h.finalize().to_hex().as_str(), "8ad835fa14e7adc0e226c03f894118872d97c985d16fe439391e5db331f6a826");
+        assert_eq!(h.finalize().to_hex().as_str(), "60c7d29d9de6eb532fce65480737c31dda154afa7e8f549aed336a3b6f13dc7d");
     }
 
     /// The GPU's per-sample form (`Button::sample`, selects) gives what `at` then `ball` give (branches), bit for bit, on the CPU's one lane: across the disc, its glow, its rim and outside.
