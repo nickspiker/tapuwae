@@ -276,7 +276,7 @@ fn orbit<L: Lane>(px: L, py: L, v: &View, need: Need) -> Orbit<L> {
             // Flames: iter² weights; past |z|² = 4 the z-flame tapers as (1 − ((ln ln |z|² − ln(2 ln 2)) / ln ln bail)²)⁶, which is in [0, 1] there because |z|² > 4 makes ln ln |z|² > ln(2 ln 2).
             let it = n + 1.;
             let it2 = it * it;
-            let taper = pick(running & r2.gt(L::splat(4.)), || { let t = (r2.fln().fln() - ln_2ln2) / lnln_bail; let t = one - t * t; let t = t * t; t * t * t }, one);
+            let taper = pick(running & r2.gt(L::splat(4.)), || { let t = if cfg!(feature = "probe_taper") { fm::log2_fast(fm::log2_fast(r2) * 0.5) * (core::f32::consts::LN_2 / lnln_bail) } else { (r2.fln().fln() - ln_2ln2) / lnln_bail }; let t = one - t * t; let t = t * t; t * t * t }, one);
             let wq = taper * it2;
             s.fq_w = live::<L, _>(running, s.fq_w + wq, s.fq_w);
             let wq_inv = wq * inv;
@@ -1325,8 +1325,9 @@ fn pack(rgb: [f32; 3], alpha: f32) -> u32 {
 #[inline]
 pub fn pack_g2t16(rgb: [f32; 3], alpha: f32) -> u64 {
     let one = ((1u32 << 16) - 1) as f32;
-    let d = |c: f32| ((one - (libm::tanhf(c) * (1u32 << 16) as f32) as u32 as f32) * alpha) as u64;
-    ((alpha * one) as u64) << 48 | d(rgb[0]) << 32 | d(rgb[1]) << 16 | d(rgb[2])
+    let t = if cfg!(feature = "probe_pack") { F4::new([rgb[0], rgb[1], rgb[2], 0.]).ftanh().to_array() } else { [libm::tanhf(rgb[0]), libm::tanhf(rgb[1]), libm::tanhf(rgb[2]), 0.] };
+    let d = |t: f32| ((one - (t * (1u32 << 16) as f32) as u32 as f32) * alpha) as u64;
+    ((alpha * one) as u64) << 48 | d(t[0]) << 32 | d(t[1]) << 16 | d(t[2])
 }
 
 /// A visible colour (display gamma 2, as every colour here is) at coverage α as ferros's 16-bit surface pixel: light over black, each channel c·α in Q14 (white = 2¹⁴, the surface's own scale), red in the low 16 bits, then green and blue, and α (Q14) in the top 16. Rounded to the nearest step; the display dithers these to the panel, so a smooth glow keeps its 14 bits instead of the 8 a fluor pixel holds.

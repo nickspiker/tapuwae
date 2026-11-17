@@ -76,6 +76,18 @@ pub fn log2_poly<L: Lane>(x: L) -> L {
     select(zero, L::splat(f32::NEG_INFINITY), l)
 }
 
+/// PROBE log₂ x for x > 0, division-free: exponent from the bits, mantissa folded to [√½, √2), u = m − 1, u·q(u) with q a degree-7 Chebyshev fit (worst 1.3e-7 over every f32 mantissa).
+#[inline(always)]
+pub fn log2_fast<L: Lane>(x: L) -> L {
+    let bits = x.to_bits();
+    let e = L::from_u32((bits >> 23) & L::U::splat(255)) - 127.;
+    let m = L::from_bits((bits & L::U::splat(0x007F_FFFF)) | L::U::splat(0x3F80_0000));
+    let big = m.gt(L::splat(SQRT_2));
+    let (m, e) = select(big, (m * 0.5, e + 1.), (m, e));
+    let u = m - 1.;
+    e + u * horner(u, [1.442695, -0.72135293, 0.4809167, -0.36022517, 0.28728887, -0.24927182, 0.23265257, -0.14275974])
+}
+
 /// ln x.
 #[inline(always)]
 pub fn ln<L: Lane>(x: L) -> L {

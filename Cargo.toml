@@ -12,6 +12,8 @@ gpu = ["dep:valhall"]
 # std: rows across the cores (rayon) and the platform's float maths. Without it (ferros's no_std processes) rows run one after another and the maths comes from libm.
 default = ["std"]
 std = ["dep:rayon", "blake3/std"]
+probe_taper = []
+probe_pack = []
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
