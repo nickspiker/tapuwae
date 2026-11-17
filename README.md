@@ -24,7 +24,9 @@ Without the default `std` feature the crate is `no_std` (ferros's processes): ro
 
 ## Speed: NEON now, the GPU later
 
-The render is f32 per sample, a few dozen iterations then the shading, and the shading is most of the cost (measured on the desktop: about 70%, half of it libm). The plan: samples on a stratified grid (`Aa::Stratified`), four samples of a pixel at a time in NEON lanes, the shading's transcendentals as our own polynomials (no libm, no data-dependent branches).
+The render is f32 per sample, a few dozen iterations then the shading. It runs four samples at a time in one 128-bit register (`F4`: NEON on aarch64, SSE2 on x86-64, through `core::arch`), each lane operation the scalar's own IEEE operation, so four lanes draw the one-lane path's bits; the transcendentals are the crate's own polynomials (`fm`, no libm, no data-dependent branches). The plain disc (Photon's avatars) gives each lane one pixel, from its first adaptive sample to its last.
+
+Measured on the desktop (one core, 2026-11-17): Photon's 72 px avatar 7.9 ms to 3.0 ms, its 480 px one 246 ms to 89 ms, the same pixels. Most of what is left is the orbit's loop (a root and a divide a step, about 26 steps a sample) and the shading's dozen-odd transcendentals.
 
 **This must move to the GPU once ferros drives the Mali** (it needs the CSF firmware and a shader compiler: ferros KERNEL.md). A pixel's 4 × 4 grid is exactly one 16-lane Valhall warp, and the shading written branch-free for NEON is already a shader's shape; keep it that way.
 
