@@ -158,7 +158,7 @@ pub fn button_orbit_only_kernel(r: f32, p: &Params, look: &Look) -> Compiled {
     let gw = F::splat(bt.rad) / (one - q2).sqrt_rounded();
     let (a, b) = (q.0 * gw, q.1 * gw);
     let (x, y) = (a * v.rot.0 + v.centre.0 - b * v.rot.1, a * v.rot.1 + v.centre.1 + b * v.rot.0);
-    let o = crate::orbit(x, y, v);
+    let o = crate::orbit(x, y, v, crate::Need::ALL);
     ssa::store_at(0, idx, 3, 0, o.n.to_bits());
     ssa::store_at(0, idx, 3, 4, o.dm.to_bits());
     ssa::compile()

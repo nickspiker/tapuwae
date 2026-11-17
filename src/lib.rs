@@ -180,6 +180,19 @@ struct Carry<L: Lane> {
     r2: L,
 }
 
+/// Which of the orbit's optional results a look reads (`orbit`): the engraving's crossing (an engraving or the enamel's cells), the trap's closest approach (colouring mode 2).
+#[derive(Clone, Copy)]
+struct Need {
+    engrave: bool,
+    trap: bool,
+}
+
+impl Need {
+    /// Everything, as the orbit always worked it out.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    const ALL: Need = Need { engrave: true, trap: true };
+}
+
 struct Orbit<L> {
     n: L,
     x: L,
@@ -204,8 +217,9 @@ struct Orbit<L> {
 /// The derivative is tracked by magnitude only (|dz| ← 2·|z|·|dz|, plus 1 in the parameter plane), which is all the distance estimate needs.
 /// It can overflow to infinity near the set, which the distance estimate reads, correctly, as "on the set".
 /// Four lanes iterate together until the last of them escapes (or MAX_ITER): a lane that has escaped is frozen (`live`), so what it returns is its state at its own escape, exactly as one lane alone returns at it.
+/// `need` says which optional results the look reads (the engraving's crossing, the trap's approach); one it does not read stays at its starting value and costs nothing, the rest are as they always were.
 #[inline]
-fn orbit<L: Lane>(px: L, py: L, v: &View) -> Orbit<L> {
+fn orbit<L: Lane>(px: L, py: L, v: &View, need: Need) -> Orbit<L> {
     let (zero, one) = (L::splat(0.), L::splat(1.));
     let (z, c, plus, dm) = match v.kind {
         Kind::Plane => ((zero, zero), (px, py), one, zero),
@@ -240,17 +254,21 @@ fn orbit<L: Lane>(px: L, py: L, v: &View) -> Orbit<L> {
         },
         |n, mut s| {
             let (x2, y2, r2, running, z) = (s.x2, s.y2, s.r2, s.running, s.z);
-            let first = running & !s.engraved & r2.gt(L::splat(ENGRAVE_SQ));
-            if first.any() {
-                s.engraved = s.engraved | first;
-                s.e_n = select(first, n, s.e_n);
-                s.e_r2 = select(first, r2, s.e_r2);
-                s.e_z = select(first, z, s.e_z);
-                s.e_dm = select(first, s.dm, s.e_dm);
-                s.e_exp = select(first, s.dm_exp, s.e_exp);
+            if need.engrave {
+                let first = running & !s.engraved & r2.gt(L::splat(ENGRAVE_SQ));
+                if first.any() {
+                    s.engraved = s.engraved | first;
+                    s.e_n = select(first, n, s.e_n);
+                    s.e_r2 = select(first, r2, s.e_r2);
+                    s.e_z = select(first, z, s.e_z);
+                    s.e_dm = select(first, s.dm, s.e_dm);
+                    s.e_exp = select(first, s.dm_exp, s.e_exp);
+                }
             }
-            let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
-            s.trap_sq = live::<L, _>(running, s.trap_sq.min(tx * tx + ty * ty), s.trap_sq);
+            if need.trap {
+                let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
+                s.trap_sq = live::<L, _>(running, s.trap_sq.min(tx * tx + ty * ty), s.trap_sq);
+            }
             let rz = r2.sqrt();
             // One reciprocal a step serves every term that divides by |z| or |z|² (the flames' weights and means, the direction's turn): a vector divide is among the slowest instructions, and this loop took seven a step.
             let inv = one / rz;
@@ -287,11 +305,15 @@ fn orbit<L: Lane>(px: L, py: L, v: &View) -> Orbit<L> {
     );
     let Carry { z, dm, dm_exp, dir, trap_sq, fq, fq_w, fc, fc_w, e_n, e_r2, e_z, e_dm, e_exp, engraved, n_esc, .. } = s;
     // The engraving at the crossing, from what the loop kept there: the same arithmetic on the same values the crossing pass used to work it out with.
-    let (lv, ray, ln_turn) = pick(
-        engraved,
-        || (e_n + 1. - (e_r2.fln() / ENGRAVE_SQ.fln()).flog2(), e_z.1.fatan2(e_z.0) * (1. / TAU as f32), e_dm.fln() + e_exp * core::f32::consts::LN_2 - e_r2.fln() * 0.5),
-        (zero, zero, zero),
-    );
+    let (lv, ray, ln_turn) = if need.engrave {
+        pick(
+            engraved,
+            || (e_n + 1. - (e_r2.fln() / ENGRAVE_SQ.fln()).flog2(), e_z.1.fatan2(e_z.0) * (1. / TAU as f32), e_dm.fln() + e_exp * core::f32::consts::LN_2 - e_r2.fln() * 0.5),
+            (zero, zero, zero),
+        )
+    } else {
+        (zero, zero, zero)
+    };
     let escaped = n_esc.lt(L::splat(MAX_ITER as f32));
     // u = z / dz, as a direction: z/|z| times the conjugate of dz's direction.
     let (ux, uy) = if julia {
@@ -1070,7 +1092,11 @@ fn in_plane<L: Lane>(d: (f32, f32, f32), rot: (L, L)) -> (L, L, L) {
 #[inline]
 fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), hair: L, frame: (L, L)) -> ([L; 3], L) {
     let (zero, one) = (L::splat(0.), L::splat(1.));
-    let o = orbit(x, y, v);
+    // How the picture is made: soft colours (the avatars'), a medal, enamel or lacquer (see `Attest::style`); and whether it is engraved (enamel always is), which with the colouring method says what the orbit must keep.
+    let style = look.style.of(v.attest.style);
+    let engrave = look.engrave.of(v.attest.engrave);
+    let engrave = if style == 2 && engrave == 0 { 1 } else { engrave };
+    let o = orbit(x, y, v, Need { engrave: engrave != 0, trap: v.mode == 2 });
     let r = (o.x * o.x + o.y * o.y).sqrt();
     let escaped = o.n.lt(L::splat(MAX_ITER as f32));
     // Smooth iteration count, normalised to the escape: n + 1 − log₂(ln|z|² / ln bail).
@@ -1156,16 +1182,12 @@ fn shade<L: Lane>(x: L, y: L, v: &View, k: L, look: &Look, sphere: (L, L, L), ha
     // Lightness and saturation: the ground's, moving to the body's on the set and the edge's around it, settling back to the ground far out; the slope's shading on top, everywhere it tilts.
     let lightness = body * (th.body_l - th.ground_l) + th.ground_l + edge * (th.rim_l - th.ground_l) * (one - far) + shading + breathe;
     let sat = body * (th.body_s - th.ground_s) + th.ground_s + edge * (th.rim_s - th.ground_s) * (one - far);
-    // How the picture is made: soft colours (the avatars'), a medal, or enamel (see `Attest::style`).
-    let style = look.style.of(v.attest.style);
     // The engraving (attest): hairlines `hair` pixels wide on the level lines of the potential and on the rays, both read where the orbit first passed 2⁸ (see `Orbit`), so each level's rays meet the next level's twice as many exactly on a level line. Enamel needs its wires, so a device with no engraving gets level lines there.
     // A line's distance in pixels is its coordinate's distance to the nearest whole number over the coordinate's change per pixel, with |sin(πx)|/π standing in for that distance (C∞, and the same near a line); each family fades in as its lines get more than 2³ hairs apart (`apart`), so they never crowd into hatching near the set.
-    let engrave = look.engrave.of(v.attest.engrave);
-    let engrave = if style == 2 && engrave == 0 { 1 } else { engrave };
     let pi = core::f32::consts::PI;
     let (m_lv, n_ray) = (v.attest.levels, v.attest.rays);
-    let lv_px = L::splat(m_lv) / (dist_px * core::f32::consts::LN_2);
-    let ray_px = o.ln_turn.fexp() * n_ray * k / tau;
+    // Lines per pixel of each family, read only where there is an engraving (the lines and the enamel's cells).
+    let (lv_px, ray_px) = if engrave != 0 { (L::splat(m_lv) / (dist_px * core::f32::consts::LN_2), o.ln_turn.fexp() * n_ray * k / tau) } else { (zero, zero) };
     let apart = |per_px: L| {
         let s = one / per_px;
         let crowd = hair * 8.;
